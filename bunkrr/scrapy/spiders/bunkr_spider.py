@@ -4,8 +4,8 @@ import signal
 import sys
 import os
 from pathlib import Path
-from typing import Generator, List, Optional, Dict, Any, Set, Union, Callable, TypeVar
-from urllib.parse import urljoin
+from typing import Generator, List, Optional, Dict, Any, Set, Union, Callable, TypeVar, Iterator
+from urllib.parse import urljoin, urlparse
 import random
 import atexit
 import re
@@ -21,7 +21,7 @@ from ...core.config import DownloadConfig
 from ...core.logger import setup_logger
 from ...ui.progress import ProgressTracker
 from ...downloader.rate_limiter import RateLimiter
-from ...core.exceptions import ScrapyError, BunkrrError
+from ...core.exceptions import ScrapyError, BunkrrError, SpiderError
 from ...core.error_handler import ErrorHandler
 
 from bs4 import BeautifulSoup, SoupStrainer
@@ -516,10 +516,15 @@ class BunkrSpider(Spider):
         if self.progress_tracker:
             self.progress_tracker.update(failed=1)
 
-    def start_requests(self) -> List[Request]:
+    def normalize_url(self, url: str) -> str:
+        """Normalize URL for comparison."""
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    def start_requests(self) -> Generator[Request, None, None]:
         """Generate initial requests."""
         for url in self.config.start_urls:
-            normalized = normalize_url(url)
+            normalized = self.normalize_url(url)
             if normalized not in self._visited_urls:
                 self._visited_urls.add(normalized)
                 yield Request(url=url, callback=self.parse)
@@ -553,7 +558,7 @@ class BunkrSpider(Spider):
             if result and not result.get('url'):
                 self._result_pool.put(result)
     
-    def _parse_album(self, response: Response) -> Dict:
+    def _parse_album(self, response: Response) -> Dict[str, Any]:
         """Parse album page."""
         soup = BeautifulSoup(response.text, 'lxml', parse_only=ALBUM_STRAINER)
         result = self._result_pool.get()
@@ -600,7 +605,7 @@ class BunkrSpider(Spider):
             self._result_pool.put(result)
             raise SpiderError(f"Failed to parse album: {e}")
     
-    def _parse_media(self, response: Response) -> Dict:
+    def _parse_media(self, response: Response) -> Dict[str, Any]:
         """Parse media page."""
         soup = BeautifulSoup(response.text, 'lxml', parse_only=MEDIA_STRAINER)
         result = self._result_pool.get()
