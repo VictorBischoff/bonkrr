@@ -9,11 +9,11 @@ from urllib.parse import unquote, urlparse, urljoin, parse_qs
 from aiohttp import ClientSession, ClientTimeout, client_exceptions, TCPConnector
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
-from rich.progress import Progress, TaskID
 import aiofiles
 
 from .config import DownloadConfig
 from .logger import setup_logger, log_exception, log_html_error
+from .ui import DownloadProgress
 
 logger = setup_logger('bunkrr.processor')
 
@@ -51,6 +51,7 @@ class MediaProcessor:
         self._connector = connector
         self._processed_urls: Set[str] = set()
         self._url_pattern = re.compile(r'/[aif]/([A-Za-z0-9]+)')  # Precompile regex
+        self._progress = DownloadProgress()
         
         logger.info(
             "Initialized MediaProcessor",
@@ -61,48 +62,27 @@ class MediaProcessor:
                 "connection_pool_size": config.max_concurrent_downloads * 2
             }
         )
-        
+
     async def __aenter__(self):
-        """Set up async context with optimized session."""
-        timeout = ClientTimeout(
-            total=self.config.download_timeout,
-            connect=30,  # Add specific timeouts
-            sock_read=30
-        )
-        
-        self._session = ClientSession(
-            timeout=timeout,
-            connector=self._connector,
-            headers={  # Set default headers once
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'identity',
-                'Connection': 'keep-alive'
-            }
-        )
-        logger.debug("Created optimized ClientSession with timeout %ds", self.config.download_timeout)
+        """Set up async context with improved session configuration."""
+        if not self._session:
+            timeout = ClientTimeout(total=self.config.download_timeout)
+            self._session = ClientSession(
+                connector=self._connector,
+                timeout=timeout,
+                raise_for_status=True
+            )
+            logger.debug("Created new ClientSession")
         return self
-        
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Clean up async context."""
+        """Clean up resources properly."""
         if self._session:
             await self._session.close()
-        if self._connector:
             await self._connector.close()
         logger.debug("Closed ClientSession and Connector")
 
-    def _get_random_user_agent(self) -> str:
-        """Get a random user agent string."""
-        try:
-            ua = UserAgent()
-            agent = ua.random
-            logger.debug("Generated random user agent: %s", agent)
-            return agent
-        except Exception as e:
-            log_exception(logger, e, "user agent generation")
-            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            
-    async def process_album(self, album_url: str, parent_folder: Path, progress: Progress) -> Tuple[int, int]:
+    async def process_album(self, album_url: str, parent_folder: Path) -> Tuple[int, int]:
         """Process a single album URL with optimized batch processing."""
         logger.info("Processing album: %s", album_url)
         
@@ -156,9 +136,229 @@ class MediaProcessor:
         return await self._download_media_from_urls(
             album_info['media_info'],  # Pass complete media info
             album_folder,
-            progress
+            album_info['title']
         )
+
+    async def _download_media_from_urls(
+        self,
+        media_info: List[Dict[str, Any]],
+        album_folder: Path,
+        album_title: str
+    ) -> Tuple[int, int]:
+        """Download media files from URLs with optimized batching."""
+        if not media_info:
+            logger.error("No media info provided for download")
+            return 0, 0
+
+        total_files = len(media_info)
+        chunk_size = min(self.config.max_concurrent_downloads, 10)
+        total_chunks = (total_files + chunk_size - 1) // chunk_size
+
+        success_count = 0
+        failed_count = 0
+
+        # Initialize progress tracking
+        self._progress.update_album(album_title, total_files)
+        self._progress.start()
+
+        for chunk_idx in range(total_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, total_files)
+            chunk = media_info[start_idx:end_idx]
+
+            logger.debug(
+                "Processing chunk %d/%d (%d files)",
+                chunk_idx + 1,
+                total_chunks,
+                len(chunk)
+            )
+
+            # Create tasks for concurrent downloads
+            tasks = []
+            for i, item in enumerate(chunk):
+                file_url = item['url']
+                # Use original filename if available, otherwise generate one
+                filename = item.get('filename') or f"{start_idx+i:04d}_{Path(urlparse(file_url).path).name}"
+                
+                # Skip if file exists and is valid
+                file_path = album_folder / filename
+                if file_path.exists() and file_path.stat().st_size > 0:
+                    logger.debug("Skipping existing file: %s", filename)
+                    success_count += 1
+                    self._progress.update_progress(advance=1)
+                    continue
+
+                tasks.append(
+                    asyncio.create_task(
+                        self._download_file(
+                            file_url,
+                            file_path
+                        )
+                    )
+                )
+
+            if tasks:
+                # Wait for all tasks in chunk to complete
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error("Download failed: %s", str(result))
+                        failed_count += 1
+                        self._progress.update_progress(advance=1, failed=True)
+                    elif isinstance(result, tuple):
+                        success, size = result
+                        if success:
+                            success_count += 1
+                            self._progress.update_progress(advance=1, downloaded=size)
+                        else:
+                            failed_count += 1
+                            self._progress.update_progress(advance=1, failed=True)
+
+            # Add delay between chunks based on rate limit
+            if chunk_idx < total_chunks - 1:
+                delay = self.config.rate_window / self.config.rate_limit
+                logger.debug("Waiting %.2fs before next chunk", delay)
+                await asyncio.sleep(delay)
+
+        # Stop progress tracking and show summary
+        self._progress.stop()
+        return success_count, failed_count
+
+    async def _download_file(
+        self,
+        url: str,
+        file_path: Path
+    ) -> Tuple[bool, int]:
+        """Download a single file with improved error handling."""
+        temp_path = file_path.with_suffix('.part')
+        retry_count = 0
+        max_retries = self.config.max_retries
         
+        while retry_count < max_retries:
+            try:
+                # First get the direct download URL
+                download_url = await self._get_download_url(url)
+                if not download_url:
+                    logger.error("Failed to get download URL for: %s", url)
+                    return False, 0
+
+                headers = {
+                    'User-Agent': self._get_random_user_agent(),
+                    'Accept': '*/*',
+                    'Accept-Encoding': 'identity',
+                    'Referer': 'https://bunkr.site/'
+                }
+
+                async with self._download_semaphore:
+                    await self._rate_limiter.acquire()
+                    
+                    async with self._session.get(
+                        download_url,
+                        headers=headers,
+                        allow_redirects=True,
+                        ssl=False  # Skip SSL verification for performance
+                    ) as response:
+                        if response.status == 429:
+                            retry_count += 1
+                            retry_after = int(response.headers.get('Retry-After', self.config.retry_delay))
+                            logger.warning(
+                                "Rate limit hit for %s, waiting %ds (retry %d/%d)",
+                                file_path.name,
+                                retry_after,
+                                retry_count,
+                                max_retries
+                            )
+                            await asyncio.sleep(retry_after)
+                            continue
+
+                        if response.status != 200:
+                            logger.error(
+                                "Failed to download %s: HTTP %d",
+                                download_url,
+                                response.status
+                            )
+                            if retry_count < max_retries - 1:
+                                retry_count += 1
+                                await asyncio.sleep(self.config.retry_delay)
+                                continue
+                            return False, 0
+
+                        # Get content length for size verification
+                        content_length = int(response.headers.get('content-length', 0))
+                        if content_length < self.config.min_file_size:
+                            logger.error(
+                                "Content length too small: %s (%d bytes)",
+                                file_path.name,
+                                content_length
+                            )
+                            return False, 0
+
+                        # Check content type
+                        content_type = response.headers.get('content-type', '')
+                        if 'text/html' in content_type:
+                            logger.error(
+                                "Received HTML instead of file: %s",
+                                download_url
+                            )
+                            return False, 0
+
+                        # Open file in append mode if it exists and is incomplete
+                        mode = 'ab' if temp_path.exists() else 'wb'
+                        downloaded_size = 0
+                        async with aiofiles.open(temp_path, mode) as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                if asyncio.current_task().cancelled():
+                                    logger.info("Download cancelled: %s", file_path.name)
+                                    raise asyncio.CancelledError()
+                                await f.write(chunk)
+                                downloaded_size += len(chunk)
+
+                        # If we got here, the download was successful
+                        break
+
+            except asyncio.CancelledError:
+                logger.info("Download cancelled: %s", file_path.name)
+                if temp_path.exists():
+                    temp_path.unlink()
+                raise
+            except Exception as e:
+                log_exception(logger, e, f"downloading {url}")
+                if retry_count < max_retries - 1:
+                    retry_count += 1
+                    await asyncio.sleep(self.config.retry_delay)
+                    continue
+                if temp_path.exists():
+                    temp_path.unlink()
+                return False, 0
+
+        # Verify download
+        if not temp_path.exists() or temp_path.stat().st_size < self.config.min_file_size:
+            logger.error(
+                "Downloaded file too small: %s (%d bytes)",
+                file_path.name,
+                temp_path.stat().st_size if temp_path.exists() else 0
+            )
+            if temp_path.exists():
+                temp_path.unlink()
+            return False, 0
+
+        # Rename temp file to final name
+        temp_path.rename(file_path)
+        return True, downloaded_size
+
+    def _get_random_user_agent(self) -> str:
+        """Get a random user agent string."""
+        try:
+            ua = UserAgent()
+            agent = ua.random
+            logger.debug("Generated random user agent: %s", agent)
+            return agent
+        except Exception as e:
+            log_exception(logger, e, "user agent generation")
+            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            
     def _extract_album_id(self, url: str) -> Optional[str]:
         """Extract album ID using precompiled regex."""
         if match := self._url_pattern.search(url):
@@ -348,215 +548,6 @@ class MediaProcessor:
             error_details={'error': 'No download URL found'}
         )
         return None
-        
-    async def _download_media_from_urls(
-        self,
-        media_info: List[Dict[str, Any]],
-        album_folder: Path,
-        progress: Progress
-    ) -> Tuple[int, int]:
-        """Download media files from URLs with optimized batching."""
-        if not media_info:
-            logger.error("No media info provided for download")
-            return 0, 0
-
-        total_files = len(media_info)
-        chunk_size = min(self.config.max_concurrent_downloads, 10)
-        total_chunks = (total_files + chunk_size - 1) // chunk_size
-
-        success_count = 0
-        failed_count = 0
-
-        # Create progress bar
-        task_id = progress.add_task(
-            f"[cyan]Downloading {total_files} files...",
-            total=total_files
-        )
-
-        for chunk_idx in range(total_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, total_files)
-            chunk = media_info[start_idx:end_idx]
-
-            logger.debug(
-                "Processing chunk %d/%d (%d files)",
-                chunk_idx + 1,
-                total_chunks,
-                len(chunk)
-            )
-
-            # Create tasks for concurrent downloads
-            tasks = []
-            for i, item in enumerate(chunk):
-                file_url = item['url']
-                # Use original filename if available, otherwise generate one
-                filename = item.get('filename') or f"{start_idx+i:04d}_{Path(urlparse(file_url).path).name}"
-                
-                # Skip if file exists and is valid
-                file_path = album_folder / filename
-                if file_path.exists() and file_path.stat().st_size > 0:
-                    logger.debug("Skipping existing file: %s", filename)
-                    success_count += 1
-                    progress.update(task_id, advance=1)
-                    continue
-
-                tasks.append(
-                    asyncio.create_task(
-                        self._download_file(
-                            file_url,
-                            file_path,
-                            progress,
-                            task_id
-                        )
-                    )
-                )
-
-            if tasks:
-                # Wait for all tasks in chunk to complete
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Process results
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.error("Download failed: %s", str(result))
-                        failed_count += 1
-                        progress.update(task_id, advance=1)
-                    elif result:
-                        success_count += 1
-                        progress.update(task_id, advance=1)
-                    else:
-                        failed_count += 1
-                        progress.update(task_id, advance=1)
-
-            # Add delay between chunks based on rate limit
-            if chunk_idx < total_chunks - 1:
-                delay = self.config.rate_window / self.config.rate_limit
-                logger.debug("Waiting %.2fs before next chunk", delay)
-                await asyncio.sleep(delay)
-
-        return success_count, failed_count
-        
-    async def _download_file(
-        self,
-        url: str,
-        file_path: Path,
-        progress: Progress,
-        task_id: TaskID
-    ) -> bool:
-        """Download a single file with improved error handling."""
-        temp_path = file_path.with_suffix('.part')
-        retry_count = 0
-        max_retries = self.config.max_retries
-        
-        while retry_count < max_retries:
-            try:
-                # First get the direct download URL
-                download_url = await self._get_download_url(url)
-                if not download_url:
-                    logger.error("Failed to get download URL for: %s", url)
-                    return False
-
-                headers = {
-                    'User-Agent': self._get_random_user_agent(),
-                    'Accept': '*/*',
-                    'Accept-Encoding': 'identity',
-                    'Referer': 'https://bunkr.site/'
-                }
-
-                async with self._download_semaphore:
-                    await self._rate_limiter.acquire()
-                    
-                    async with self._session.get(
-                        download_url,
-                        headers=headers,
-                        allow_redirects=True,
-                        ssl=False  # Skip SSL verification for performance
-                    ) as response:
-                        if response.status == 429:
-                            retry_count += 1
-                            retry_after = int(response.headers.get('Retry-After', self.config.retry_delay))
-                            logger.warning(
-                                "Rate limit hit for %s, waiting %ds (retry %d/%d)",
-                                file_path.name,
-                                retry_after,
-                                retry_count,
-                                max_retries
-                            )
-                            await asyncio.sleep(retry_after)
-                            continue
-                            
-                        if response.status != 200:
-                            logger.error(
-                                "Failed to download %s: HTTP %d",
-                                download_url,
-                                response.status
-                            )
-                            if retry_count < max_retries - 1:
-                                retry_count += 1
-                                await asyncio.sleep(self.config.retry_delay)
-                                continue
-                            return False
-
-                        # Get content length for size verification
-                        content_length = int(response.headers.get('content-length', 0))
-                        if content_length < self.config.min_file_size:
-                            logger.error(
-                                "Content length too small: %s (%d bytes)",
-                                file_path.name,
-                                content_length
-                            )
-                            return False
-
-                        # Check content type
-                        content_type = response.headers.get('content-type', '')
-                        if 'text/html' in content_type:
-                            logger.error(
-                                "Received HTML instead of file: %s",
-                                download_url
-                            )
-                            return False
-
-                        # Open file in append mode if it exists and is incomplete
-                        mode = 'ab' if temp_path.exists() else 'wb'
-                        async with aiofiles.open(temp_path, mode) as f:
-                            async for chunk in response.content.iter_chunked(8192):
-                                if asyncio.current_task().cancelled():
-                                    logger.info("Download cancelled: %s", file_path.name)
-                                    raise asyncio.CancelledError()
-                                await f.write(chunk)
-
-                        # If we got here, the download was successful
-                        break
-
-            except asyncio.CancelledError:
-                logger.info("Download cancelled: %s", file_path.name)
-                if temp_path.exists():
-                    temp_path.unlink()
-                raise
-            except Exception as e:
-                log_exception(logger, e, f"downloading {url}")
-                if retry_count < max_retries - 1:
-                    retry_count += 1
-                    await asyncio.sleep(self.config.retry_delay)
-                    continue
-                if temp_path.exists():
-                    temp_path.unlink()
-                return False
-
-        # Verify download
-        if not temp_path.exists() or temp_path.stat().st_size < self.config.min_file_size:
-            logger.error(
-                "Downloaded file too small: %s (%d bytes)",
-                file_path.name,
-                temp_path.stat().st_size if temp_path.exists() else 0
-            )
-            if temp_path.exists():
-                temp_path.unlink()
-            return False
-
-        # Rename temp file to final name
-        temp_path.rename(file_path)
-        return True
         
     async def _get_download_url(self, file_url: str) -> Optional[str]:
         """Get the actual download URL from a file page with improved extraction."""
