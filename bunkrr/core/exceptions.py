@@ -135,6 +135,14 @@ class HTTPError(BunkrrError):
         })
         return error_dict
 
+class ConfigVersionError(ConfigError):
+    """Raised when there is a configuration version mismatch or migration error."""
+    pass
+
+class ShutdownError(BunkrrError):
+    """Raised when there is an error during application shutdown."""
+    pass
+
 # Error codes for specific error types
 ERROR_CODES = {
     ConfigError: 'CONFIG_ERROR',

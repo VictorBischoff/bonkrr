@@ -1,18 +1,31 @@
 """HTTP utilities for the bunkrr package."""
-from typing import Dict, Optional, Tuple, Union
+import asyncio
+import socket
+from typing import Dict, Optional, Tuple, Union, List, Set
 from urllib.parse import urljoin, urlparse
+from collections import defaultdict
 
 import aiohttp
-from aiohttp import ClientResponse, ClientSession, ClientTimeout
+import aiodns
+from aiohttp import (
+    ClientResponse, ClientSession, ClientTimeout,
+    TCPConnector, ClientError
+)
 from yarl import URL
 
-from ..core.exceptions import DownloadError
+from ..core.exceptions import DownloadError, HTTPError
 from ..core.logger import setup_logger
 
 logger = setup_logger('bunkrr.http')
 
 # Default timeout settings
 DEFAULT_TIMEOUT = ClientTimeout(total=30, connect=10)
+
+# Default connection limits
+DEFAULT_POOL_SIZE = 100
+DEFAULT_MAX_REQUESTS_PER_HOST = 10
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 30
+DEFAULT_KEEPALIVE_TIMEOUT = 30
 
 # Common headers
 DEFAULT_HEADERS = {
@@ -31,15 +44,78 @@ DEFAULT_HEADERS = {
     'Cache-Control': 'no-cache'
 }
 
+class DNSCache:
+    """DNS cache with TTL support."""
+    
+    def __init__(self, ttl: int = 300):
+        """Initialize DNS cache."""
+        self.ttl = ttl
+        self._cache: Dict[str, Tuple[List[str], float]] = {}
+        self._resolver = aiodns.DNSResolver()
+        
+    async def resolve(self, hostname: str) -> List[str]:
+        """Resolve hostname with caching."""
+        now = asyncio.get_event_loop().time()
+        
+        # Check cache
+        if hostname in self._cache:
+            addresses, timestamp = self._cache[hostname]
+            if now - timestamp < self.ttl:
+                return addresses
+                
+        # Resolve
+        try:
+            result = await self._resolver.query(hostname, 'A')
+            addresses = [r.host for r in result]
+            self._cache[hostname] = (addresses, now)
+            return addresses
+        except Exception as e:
+            logger.error("DNS resolution failed for %s: %s", hostname, e)
+            raise HTTPError(f"DNS resolution failed: {e}")
+
+class RequestQueue:
+    """Request queue with per-host rate limiting."""
+    
+    def __init__(self, max_requests_per_host: int = DEFAULT_MAX_REQUESTS_PER_HOST):
+        """Initialize request queue."""
+        self.max_requests_per_host = max_requests_per_host
+        self._active_requests: Dict[str, int] = defaultdict(int)
+        self._queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        
+    async def acquire(self, hostname: str) -> None:
+        """Acquire slot for request to hostname."""
+        if self._active_requests[hostname] >= self.max_requests_per_host:
+            # Wait for slot
+            queue = self._queues[hostname]
+            await queue.put(None)
+            await queue.get()
+            
+        self._active_requests[hostname] += 1
+        
+    def release(self, hostname: str) -> None:
+        """Release slot for hostname."""
+        self._active_requests[hostname] = max(0, self._active_requests[hostname] - 1)
+        
+        # Notify waiting requests
+        queue = self._queues[hostname]
+        if not queue.empty():
+            queue.get_nowait()
+            queue.put_nowait(None)
+
 class HTTPClient:
-    """HTTP client with session management and retries."""
+    """HTTP client with connection pooling and request queuing."""
     
     def __init__(
         self,
         timeout: Optional[Union[float, ClientTimeout]] = None,
         headers: Optional[Dict[str, str]] = None,
         max_retries: int = 3,
-        retry_codes: Optional[set[int]] = None
+        retry_codes: Optional[Set[int]] = None,
+        pool_size: int = DEFAULT_POOL_SIZE,
+        max_requests_per_host: int = DEFAULT_MAX_REQUESTS_PER_HOST,
+        keepalive_timeout: int = DEFAULT_KEEPALIVE_TIMEOUT,
+        max_keepalive_connections: int = DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+        dns_cache_ttl: int = 300
     ):
         """Initialize HTTP client."""
         self.timeout = timeout or DEFAULT_TIMEOUT
@@ -49,12 +125,25 @@ class HTTPClient:
         self.headers = {**DEFAULT_HEADERS, **(headers or {})}
         self.max_retries = max_retries
         self.retry_codes = retry_codes or {408, 429, 500, 502, 503, 504}
+        
+        # Connection management
+        self._connector = TCPConnector(
+            limit=pool_size,
+            limit_per_host=max_requests_per_host,
+            keepalive_timeout=keepalive_timeout,
+            force_close=False,
+            enable_cleanup_closed=True
+        )
+        
         self._session: Optional[ClientSession] = None
-    
+        self._dns_cache = DNSCache(ttl=dns_cache_ttl)
+        self._request_queue = RequestQueue(max_requests_per_host)
+        
     async def __aenter__(self) -> 'HTTPClient':
         """Create session on enter."""
         if not self._session:
             self._session = aiohttp.ClientSession(
+                connector=self._connector,
                 timeout=self.timeout,
                 headers=self.headers
             )
@@ -72,6 +161,19 @@ class HTTPClient:
         if not self._session:
             raise RuntimeError("Session not initialized. Use async with context.")
         return self._session
+    
+    async def _resolve_url(self, url: Union[str, URL]) -> Tuple[str, str]:
+        """Resolve URL to hostname and address."""
+        if isinstance(url, str):
+            url = URL(url)
+            
+        hostname = url.host
+        try:
+            addresses = await self._dns_cache.resolve(hostname)
+            return hostname, addresses[0]
+        except Exception as e:
+            logger.error("Failed to resolve %s: %s", hostname, e)
+            raise HTTPError(f"Failed to resolve {hostname}: {e}")
     
     async def _handle_response(
         self,
@@ -98,62 +200,76 @@ class HTTPClient:
         # Non-retryable error
         error_msg = f"HTTP {status}"
         try:
-            error_msg = f"{error_msg} - {await response.text()}"
-        except:
+            error_msg = f"{error_msg}: {await response.text()}"
+        except Exception:
             pass
             
-        raise DownloadError(
-            f"Failed to download {url}",
-            f"Status: {status}, Error: {error_msg}"
-        )
+        raise HTTPError(error_msg)
     
-    async def get(
+    async def request(
         self,
-        url: str,
-        params: Optional[Dict] = None,
-        headers: Optional[Dict] = None,
-        allow_redirects: bool = True
+        method: str,
+        url: Union[str, URL],
+        **kwargs
     ) -> ClientResponse:
-        """Send GET request with retries."""
-        merged_headers = {**self.headers, **(headers or {})}
+        """Make HTTP request with retries and queuing."""
+        hostname, address = await self._resolve_url(url)
         
         for retry in range(self.max_retries + 1):
             try:
-                response = await self.session.get(
-                    url,
-                    params=params,
-                    headers=merged_headers,
-                    allow_redirects=allow_redirects
-                )
+                # Wait for available slot
+                await self._request_queue.acquire(hostname)
                 
-                should_retry, reason = await self._handle_response(
-                    response, url, retry
-                )
-                
-                if not should_retry:
-                    return response
+                try:
+                    response = await self.session.request(
+                        method,
+                        url,
+                        **kwargs
+                    )
                     
-                if reason:
+                    should_retry, reason = await self._handle_response(
+                        response,
+                        str(url),
+                        retry
+                    )
+                    
+                    if not should_retry:
+                        return response
+                        
                     logger.warning(
-                        "Retrying request to %s (%d/%d): %s",
-                        url, retry + 1, self.max_retries, reason
+                        "Retrying request to %s (%s)",
+                        url,
+                        reason
                     )
                     
-            except aiohttp.ClientError as e:
+                finally:
+                    self._request_queue.release(hostname)
+                    
+            except (ClientError, asyncio.TimeoutError) as e:
                 if retry == self.max_retries:
-                    raise DownloadError(
-                        f"Failed to download {url}",
-                        f"Error: {str(e)}"
-                    )
+                    raise HTTPError(f"Request failed after {retry + 1} attempts: {e}")
+                    
                 logger.warning(
-                    "Request failed for %s (%d/%d): %s",
-                    url, retry + 1, self.max_retries, str(e)
+                    "Request to %s failed (attempt %d/%d): %s",
+                    url,
+                    retry + 1,
+                    self.max_retries + 1,
+                    str(e)
                 )
                 
-        raise DownloadError(
-            f"Failed to download {url}",
-            "Max retries exceeded"
-        )
+        raise HTTPError(f"Request failed after {self.max_retries + 1} attempts")
+    
+    async def get(self, url: Union[str, URL], **kwargs) -> ClientResponse:
+        """Make GET request."""
+        return await self.request('GET', url, **kwargs)
+    
+    async def post(self, url: Union[str, URL], **kwargs) -> ClientResponse:
+        """Make POST request."""
+        return await self.request('POST', url, **kwargs)
+    
+    async def head(self, url: Union[str, URL], **kwargs) -> ClientResponse:
+        """Make HEAD request."""
+        return await self.request('HEAD', url, **kwargs)
 
 def normalize_url(url: str) -> str:
     """Normalize URL by removing fragments and normalizing scheme."""

@@ -1,97 +1,99 @@
-"""Logging configuration for the bunkrr package."""
+"""Logging configuration for the application."""
 import logging
-import sys
-import traceback
+import logging.handlers
+import os
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union, Dict, Any
+from typing import Optional
 
-from .exceptions import BunkrrError
+from .exceptions import ConfigError
 
-# Configure default logging format
-DEFAULT_FORMAT = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+# Constants
+DEFAULT_LOG_FORMAT = '%(asctime)s [%(name)s] %(levelname)s: %(message)s'
 DEFAULT_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+DEFAULT_LOG_LEVEL = logging.INFO
+MAX_BYTES = 10 * 1024 * 1024  # 10MB
+BACKUP_COUNT = 5
 
-class BunkrrLogger:
-    """Enhanced logger with error handling and formatting."""
+def setup_logger(name: str, log_level: Optional[int] = None) -> logging.Logger:
+    """Set up a logger with the given name and optional level."""
+    logger = logging.getLogger(name)
     
-    def __init__(self, name: str, level: int = logging.INFO):
-        """Initialize logger with name and level."""
-        self.logger = logging.getLogger(name)
-        self.logger.setLevel(level)
+    # Only configure handlers if they haven't been configured yet
+    if not logger.handlers:
+        logger.setLevel(log_level or DEFAULT_LOG_LEVEL)
         
-        if not self.logger.handlers:
-            self._setup_handlers()
-    
-    def _setup_handlers(self):
-        """Set up console and file handlers."""
+        # Create formatters
+        formatter = logging.Formatter(DEFAULT_LOG_FORMAT, DEFAULT_DATE_FORMAT)
+        detailed_formatter = logging.Formatter(
+            '%(asctime)s [%(name)s] %(levelname)s [%(filename)s:%(lineno)d]: %(message)s',
+            DEFAULT_DATE_FORMAT
+        )
+        
         # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(
-            logging.Formatter(DEFAULT_FORMAT, DEFAULT_DATE_FORMAT)
-        )
-        self.logger.addHandler(console_handler)
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
         
-        # File handler
-        log_dir = Path.home() / '.bunkrr' / 'logs'
-        log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            # Create logs directory if it doesn't exist
+            logs_dir = Path('logs')
+            logs_dir.mkdir(exist_ok=True)
+            
+            # Main log file with rotation
+            main_log = logs_dir / 'bunkrr.log'
+            file_handler = logging.handlers.RotatingFileHandler(
+                main_log,
+                maxBytes=MAX_BYTES,
+                backupCount=BACKUP_COUNT
+            )
+            file_handler.setFormatter(detailed_formatter)
+            logger.addHandler(file_handler)
+            
+            # Debug log file with rotation
+            debug_log = logs_dir / 'debug.log'
+            debug_handler = logging.handlers.RotatingFileHandler(
+                debug_log,
+                maxBytes=MAX_BYTES,
+                backupCount=BACKUP_COUNT
+            )
+            debug_handler.setFormatter(detailed_formatter)
+            debug_handler.setLevel(logging.DEBUG)
+            logger.addHandler(debug_handler)
+            
+            # Error log file with rotation
+            error_log = logs_dir / 'error.log'
+            error_handler = logging.handlers.RotatingFileHandler(
+                error_log,
+                maxBytes=MAX_BYTES,
+                backupCount=BACKUP_COUNT
+            )
+            error_handler.setFormatter(detailed_formatter)
+            error_handler.setLevel(logging.ERROR)
+            logger.addHandler(error_handler)
+            
+            # Scrapy specific log file
+            if 'scrapy' in name:
+                scrapy_log = logs_dir / 'scrapy.log'
+                scrapy_handler = logging.handlers.RotatingFileHandler(
+                    scrapy_log,
+                    maxBytes=MAX_BYTES,
+                    backupCount=BACKUP_COUNT
+                )
+                scrapy_handler.setFormatter(detailed_formatter)
+                logger.addHandler(scrapy_handler)
+                
+        except Exception as e:
+            raise ConfigError(f"Failed to set up log files: {e}")
         
-        file_handler = logging.FileHandler(
-            log_dir / 'bunkrr.log',
-            encoding='utf-8'
-        )
-        file_handler.setFormatter(
-            logging.Formatter(DEFAULT_FORMAT, DEFAULT_DATE_FORMAT)
-        )
-        self.logger.addHandler(file_handler)
-    
-    def debug(self, msg: str, *args, **kwargs):
-        """Log debug message."""
-        self.logger.debug(msg, *args, **kwargs)
-    
-    def info(self, msg: str, *args, **kwargs):
-        """Log info message."""
-        self.logger.info(msg, *args, **kwargs)
-    
-    def warning(self, msg: str, *args, **kwargs):
-        """Log warning message."""
-        self.logger.warning(msg, *args, **kwargs)
-    
-    def error(self, msg: str, *args, exc_info: bool = False, **kwargs):
-        """Log error message with optional exception info."""
-        self.logger.error(msg, *args, exc_info=exc_info, **kwargs)
-    
-    def exception(self, msg: str, *args, **kwargs):
-        """Log exception with traceback."""
-        self.logger.exception(msg, *args, **kwargs)
-    
-    def log_error(self, error: Union[Exception, BunkrrError], context: str = '', **kwargs):
-        """Log error with context and details."""
-        if isinstance(error, BunkrrError):
-            self.error(
-                f"{context}: {error.message}",
-                extra={'details': error.details} if error.details else None,
-                **kwargs
-            )
-        else:
-            self.exception(
-                f"{context}: {str(error)}",
-                extra={'traceback': traceback.format_exc()},
-                **kwargs
-            )
+    return logger
 
-_loggers: Dict[str, BunkrrLogger] = {}
-
-def setup_logger(name: str, level: int = logging.INFO) -> BunkrrLogger:
-    """Get or create a logger instance."""
-    if name not in _loggers:
-        _loggers[name] = BunkrrLogger(name, level)
-    return _loggers[name]
-
-def log_exception(
-    logger: BunkrrLogger,
-    error: Exception,
-    context: str,
-    **kwargs: Any
-) -> None:
-    """Log an exception with context."""
-    logger.log_error(error, context, **kwargs) 
+def log_exception(logger: logging.Logger, exc: Exception, context: str) -> None:
+    """Log an exception with full traceback and context."""
+    logger.error(
+        "Exception in %s: %s",
+        context,
+        str(exc),
+        exc_info=True,
+        stack_info=True
+    ) 

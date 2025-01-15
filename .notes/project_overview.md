@@ -1,46 +1,95 @@
-# Bunkrr Project Overview
+"""# Bunkrr Project Overview
 
 ## Project Description
-Bunkrr is a high-performance media downloader application designed to efficiently download media files from Bunkr.site. The application features a modern terminal user interface, robust error handling, and optimized concurrent downloads.
+Bunkrr is a high-performance media downloader application designed to efficiently download media files from Bunkr.site. The application features a modern terminal user interface, comprehensive error handling, and optimized concurrent downloads.
 
 ## Core Features
-- Asynchronous media downloads with rate limiting
+- Asynchronous media downloads with intelligent rate limiting
 - Smart retry logic with exponential backoff
 - Real-time progress tracking with rich terminal UI
 - Concurrent download management
 - Automatic file organization
 - Comprehensive error handling and logging
 - Optimized URL validation with caching
+- Centralized configuration management
 
 ## Technical Architecture
 
 ### Core Components
 1. **Core (`core/`)**
    - Configuration management (`config.py`)
+     - Centralized settings with validation
+     - Integrated Scrapy configuration
+     - Environment-aware defaults
    - Error handling system (`error_handler.py`, `exceptions.py`)
+     - Comprehensive exception hierarchy
+     - Centralized error handling
+     - Context-aware error tracking
    - Logging utilities (`logger.py`)
+     - Structured logging
+     - Rotating file handlers
+     - Contextual error reporting
 
 2. **Downloader (`downloader/`)**
    - Download management (`downloader.py`)
+     - Concurrent download handling
+     - Retry mechanisms
+     - Progress tracking
    - Rate limiting (`rate_limiter.py`)
-   - Connection pooling and session management
+     - Leaky bucket algorithm
+     - Configurable windows
+     - Thread-safe operations
 
 3. **Scrapy Integration (`scrapy/`)**
    - Media processing (`processor.py`)
+     - Efficient media extraction
+     - Pipeline integration
    - Custom pipelines (`pipelines.py`)
+     - File handling
+     - Error recovery
    - Middleware components (`middlewares.py`)
+     - Rate limiting integration
+     - Error handling
    - Spider implementations (`spiders/`)
+     - Album parsing
+     - Media discovery
 
 4. **User Interface (`ui/`)**
    - Console interface (`console.py`)
+     - Rich terminal output
+     - Interactive prompts
    - Theme management (`themes.py`)
+     - Consistent styling
+     - Color schemes
    - Progress tracking (`progress.py`)
+     - Real-time updates
+     - Statistics display
 
 5. **Utilities (`utils/`)**
    - Input validation (`input.py`)
+     - URL validation
+     - Path checking
    - Filesystem operations (`filesystem.py`)
+     - Safe file handling
+     - Path management
    - HTTP utilities (`http.py`)
+     - Connection pooling
+     - Request handling
    - Formatting helpers (`formatting.py`)
+     - Text formatting
+     - Progress display
+   - Media utilities (`media.py`)
+     - File type detection
+     - Integrity checking
+   - Statistics tracking (`stats.py`)
+     - Performance metrics
+     - Operation tracking
+   - Caching utilities (`caching.py`)
+     - Memory caching
+     - Disk caching
+   - Concurrency utilities (`concurrency.py`)
+     - Async operations
+     - Thread management
 
 ### Error Handling System
 1. **Exception Hierarchy**
@@ -97,6 +146,7 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Temporary file handling
 - Download resumption
 - File integrity verification
+- Safe file cleanup
 
 ## Development Guidelines
 
@@ -105,46 +155,32 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Comprehensive docstrings
 - Consistent error handling patterns
 - Clear logging practices
+- Modular design
 
 ### Best Practices
-- Asynchronous operations for I/O
-- Resource cleanup in context managers
-- Proper exception handling
-- Performance optimization
-- Security considerations
-- Pre-compiled regex patterns
-- Efficient data structures (sets, LRU caches)
+1. **Error Handling**
+   - Use appropriate exception types
+   - Include context information
+   - Apply error decorators consistently
+   - Log errors with sufficient detail
 
-### Error Handling Best Practices
-1. **Use Appropriate Exception Types**
-   - Choose specific exception types for different error scenarios
-   - Include relevant context information
-   - Provide clear error messages
+2. **Performance**
+   - Use async operations for I/O
+   - Implement caching where beneficial
+   - Pre-compile regular expressions
+   - Pool and reuse connections
 
-2. **Error Decorator Usage**
-   ```python
-   @handle_errors(target_error=DownloadError, context='download_operation')
-   def download_file(url: str) -> bool:
-       # Function implementation
-       pass
+3. **Resource Management**
+   - Use context managers
+   - Clean up resources properly
+   - Handle interruptions gracefully
+   - Monitor resource usage
 
-   @handle_async_errors(target_error=HTTPError, context='api_request')
-   async def make_request(url: str) -> dict:
-       # Async function implementation
-       pass
-   ```
-
-3. **Manual Error Handling**
-   ```python
-   try:
-       # Operation that might fail
-       pass
-   except Exception as e:
-       ErrorHandler.handle_error(
-           FileSystemError("Operation failed", path=str(path)),
-           context="file_operation"
-       )
-   ```
+4. **Security**
+   - Validate all inputs
+   - Handle sensitive data carefully
+   - Use safe file operations
+   - Implement rate limiting
 
 ### Testing
 - Unit tests for core functionality
@@ -152,6 +188,7 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Error scenario testing
 - Performance benchmarking
 - URL validation test suite
+- Mock external services
 
 ## Future Improvements
 1. Enhanced error recovery mechanisms
@@ -159,4 +196,6 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 3. Download queue management
 4. Bandwidth throttling options
 5. Extended file format support
-6. Advanced filtering capabilities 
+6. Advanced filtering capabilities
+7. Performance optimization
+8. Enhanced progress reporting""" 

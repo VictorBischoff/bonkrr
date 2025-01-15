@@ -1,4 +1,31 @@
-"""Error handling utilities for the bunkrr package."""
+"""Error handling utilities for the bunkrr package.
+
+This module provides centralized error handling functionality for the Bunkrr application.
+It includes decorators and utilities for consistent error handling across both synchronous
+and asynchronous code.
+
+Key Components:
+    - ErrorHandler: Central error handling class
+    - handle_errors: Decorator for synchronous functions
+    - handle_async_errors: Decorator for asynchronous functions
+
+Example Usage:
+    >>> from bunkrr.core.error_handler import handle_errors
+    >>> from bunkrr.core.exceptions import ValidationError
+    >>>
+    >>> @handle_errors(target_error=ValidationError, context='validate_url')
+    ... def validate_url(url: str) -> bool:
+    ...     if not url.startswith('http'):
+    ...         raise ValueError("Invalid URL scheme")
+    ...     return True
+    >>>
+    >>> # The error will be wrapped in ValidationError with context
+    >>> validate_url('ftp://example.com')  # Raises ValidationError
+
+See Also:
+    - bunkrr.core.exceptions: Exception hierarchy
+    - bunkrr.core.logger: Logging utilities
+"""
 import functools
 import sys
 import traceback
@@ -14,7 +41,18 @@ F = TypeVar('F', bound=Callable[..., Any])
 T = TypeVar('T')
 
 class ErrorHandler:
-    """Centralized error handler for the bunkrr package."""
+    """Centralized error handler for the bunkrr package.
+    
+    This class provides static methods for handling errors consistently across
+    the application. It includes functionality for error wrapping, logging,
+    and context tracking.
+    
+    Example:
+        >>> error = ValueError("Invalid input")
+        >>> error_info = ErrorHandler.handle_error(error, "validation", reraise=False)
+        >>> print(error_info['error_code'])
+        'UNKNOWN_ERROR'
+    """
     
     @staticmethod
     def handle_error(
@@ -22,7 +60,33 @@ class ErrorHandler:
         context: str,
         reraise: bool = True
     ) -> Dict[str, Any]:
-        """Handle an error and optionally reraise it."""
+        """Handle an error and optionally reraise it.
+        
+        Args:
+            error: The error to handle. Can be a BunkrrError or any Exception.
+            context: String describing where the error occurred.
+            reraise: Whether to reraise the error after handling.
+            
+        Returns:
+            Dict containing error information including:
+                - type: Error class name
+                - message: Error message
+                - details: Additional error details
+                - error_code: Standardized error code
+                - context: Error context
+                - traceback: Full error traceback
+                
+        Raises:
+            The original error if reraise is True.
+            
+        Example:
+            >>> try:
+            ...     raise ValueError("Invalid value")
+            ... except Exception as e:
+            ...     error_info = ErrorHandler.handle_error(e, "validation", False)
+            ...     print(error_info['type'])
+            'ValueError'
+        """
         error_info = ErrorHandler._create_error_info(error, context)
         
         # Log the error
@@ -52,7 +116,23 @@ class ErrorHandler:
         context: str,
         reraise: bool = True
     ) -> Callable[[F], F]:
-        """Decorator to wrap function errors in a specific error type."""
+        """Decorator to wrap function errors in a specific error type.
+        
+        Args:
+            target_error: The BunkrrError subclass to wrap errors in.
+            context: String describing the error context.
+            reraise: Whether to reraise wrapped errors.
+            
+        Returns:
+            A decorator function that wraps the target function.
+            
+        Example:
+            >>> @ErrorHandler.wrap_errors(ValidationError, "url_check")
+            ... def check_url(url: str) -> bool:
+            ...     if not url.startswith('http'):
+            ...         raise ValueError("Invalid URL")
+            ...     return True
+        """
         def decorator(func: F) -> F:
             @functools.wraps(func)
             def wrapper(*args: Any, **kwargs: Any) -> Any:

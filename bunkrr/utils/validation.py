@@ -2,7 +2,7 @@
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Any, Tuple
 from urllib.parse import urlparse
 
 from ..core.exceptions import ValidationError
@@ -13,53 +13,63 @@ logger = setup_logger('bunkrr.validation')
 
 # Compile regex patterns for better performance
 URL_PATTERN = re.compile(
-    r'^https?://(?:www\.)?'
+    r'^https?://(?:(?:www|cdn|i-burger|media-files)\.)?'
     r'(?:bunkr\.(?:site|ru|ph|is|to|fi))'
-    r'/[a-zA-Z0-9-_/]+$'
+    r'/(?:a|album|f|v)/[a-zA-Z0-9-_]{3,30}(?:/[^/]*)?$'
 )
 
-ALBUM_ID_PATTERN = re.compile(r'[a-zA-Z0-9-_]{3,30}')
+# Allowed domains and subdomains
+ALLOWED_DOMAINS = {
+    'bunkr.site',
+    'bunkr.ru',
+    'bunkr.ph',
+    'bunkr.is',
+    'bunkr.to',
+    'bunkr.fi'
+}
+
+ALLOWED_SUBDOMAINS = {
+    'www',
+    'cdn',
+    'i-burger',
+    'media-files'
+}
 
 class URLValidator:
     """URL validation with caching."""
     
     def __init__(self):
-        """Initialize validator with allowed domains."""
-        self.allowed_domains: Set[str] = {
-            'bunkr.site',
-            'bunkr.ru',
-            'bunkr.ph',
-            'bunkr.is',
-            'bunkr.to',
-            'bunkr.fi'
-        }
+        """Initialize validator."""
+        self._allowed_domains = ALLOWED_DOMAINS
+        self._allowed_subdomains = ALLOWED_SUBDOMAINS
     
     @lru_cache(maxsize=1024)
     def is_valid_url(self, url: str) -> bool:
         """Check if URL is valid with caching."""
         try:
-            # Basic URL pattern check
+            # Basic URL pattern check - most URLs will fail here
             if not URL_PATTERN.match(url):
                 return False
             
-            # Parse URL
+            # Parse URL - only done for URLs that pass pattern check
             parsed = urlparse(url)
             
-            # Check domain
-            if parsed.netloc not in self.allowed_domains:
+            # Split domain into parts
+            domain_parts = parsed.netloc.split('.')
+            
+            # Quick check for minimum parts
+            if len(domain_parts) < 2:
                 return False
             
-            # Check path
-            path = parsed.path.strip('/')
-            if not path:
-                return False
+            # Check subdomain if present
+            if len(domain_parts) > 2:
+                if domain_parts[0] not in self._allowed_subdomains:
+                    return False
+                domain_parts = domain_parts[1:]
             
-            # Check album ID format
-            album_id = path.split('/')[-1]
-            if not ALBUM_ID_PATTERN.match(album_id):
-                return False
-            
-            return True
+            # Check main domain
+            domain = '.'.join(domain_parts)
+            return domain in self._allowed_domains
             
         except Exception as e:
             logger.error("URL validation error: %s - %s", url, str(e))

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import threading
 from typing import Dict, Optional
+import humanize
 
 from rich.console import Console
 from rich.live import Live
@@ -15,10 +16,12 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
     TaskProgressColumn,
-    DownloadColumn
+    DownloadColumn,
+    MofNCompleteColumn
 )
 from rich.table import Table
 from rich.text import Text
+from rich.align import Align
 
 from .themes import DEFAULT_THEME
 
@@ -45,6 +48,16 @@ class DownloadStats:
         if not self.start_time:
             return 0
         return (datetime.now() - self.start_time).total_seconds()
+    
+    @property
+    def formatted_downloaded_size(self) -> str:
+        """Format downloaded size in human readable format."""
+        return humanize.naturalsize(self.downloaded_size, binary=True)
+    
+    @property
+    def formatted_elapsed_time(self) -> str:
+        """Format elapsed time in human readable format."""
+        return humanize.naturaldelta(self.elapsed_time)
 
 class ProgressTracker:
     """Singleton progress tracker for unified progress tracking."""
@@ -70,10 +83,14 @@ class ProgressTracker:
     def _setup_progress_bars(self):
         """Set up progress bars with enhanced columns."""
         self.progress = Progress(
-            SpinnerColumn(),
+            SpinnerColumn(style="progress.spinner"),
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(complete_style="progress.download"),
-            TaskProgressColumn(),
+            BarColumn(
+                complete_style="progress.download",
+                finished_style="bright_green",
+                pulse_style="progress.download"
+            ),
+            MofNCompleteColumn(),
             DownloadColumn(),
             TransferSpeedColumn(),
             TimeRemainingColumn(),
@@ -83,15 +100,19 @@ class ProgressTracker:
         
         self.total_progress = Progress(
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(complete_style="progress.percentage"),
-            TaskProgressColumn(),
+            BarColumn(
+                complete_style="progress.percentage",
+                finished_style="bright_green",
+                pulse_style="progress.percentage"
+            ),
+            MofNCompleteColumn(),
             TimeRemainingColumn(),
             console=self.console,
             expand=True
         )
         
         self.total_task_id = self.total_progress.add_task(
-            "[bright_cyan]Overall Progress",
+            "[bright_white]Overall Progress",
             total=None
         )
         self.current_task_id = None
@@ -103,7 +124,8 @@ class ProgressTracker:
             self.live = Live(
                 self._generate_layout(),
                 console=self.console,
-                refresh_per_second=4
+                refresh_per_second=4,
+                transient=True
             )
             self.live.start()
     
@@ -124,7 +146,7 @@ class ProgressTracker:
         if self.current_task_id:
             self.progress.remove_task(self.current_task_id)
         self.current_task_id = self.progress.add_task(
-            f"[bright_cyan]{album_name}",
+            f"[bright_white]Processing: [bright_cyan]{album_name}",
             total=total_files
         )
         
@@ -148,62 +170,85 @@ class ProgressTracker:
     
     def _generate_layout(self) -> Panel:
         """Generate rich layout with progress and stats."""
+        # Create stats table with improved formatting
         stats_table = Table.grid(padding=1)
         stats_table.add_row(
             Text("Files:", style="stats"),
-            Text(f"{self.stats.completed_files}/{self.stats.total_files}", style="info")
+            Text(f"{self.stats.completed_files}/{self.stats.total_files}", style="stats.value")
         )
         stats_table.add_row(
             Text("Success Rate:", style="stats"),
-            Text(f"{self.stats.success_rate:.1f}%", style="info")
+            Text(f"{self.stats.success_rate:.1f}%", 
+                 style="summary.success" if self.stats.success_rate > 90 else "summary.error")
         )
         stats_table.add_row(
             Text("Downloaded:", style="stats"),
-            Text(f"{self.stats.downloaded_size / 1024 / 1024:.1f} MB", style="info")
+            Text(self.stats.formatted_downloaded_size, style="stats.value")
         )
         stats_table.add_row(
             Text("Elapsed Time:", style="stats"),
-            Text(f"{self.stats.elapsed_time:.0f}s", style="info")
+            Text(self.stats.formatted_elapsed_time, style="stats.value")
         )
         
+        # Create layout with improved spacing and alignment
         layout = Table.grid(padding=1)
-        layout.add_row(Panel(stats_table, title="Download Statistics"))
-        layout.add_row(Panel(self.total_progress))
-        layout.add_row(Panel(self.progress, title=f"Current Album: {self.current_album or 'None'}"))
+        layout.add_row(Panel(
+            Align.center(stats_table),
+            title="Download Statistics",
+            border_style="panel.border",
+            title_align="center"
+        ))
+        layout.add_row(Panel(
+            self.total_progress,
+            border_style="panel.border"
+        ))
+        layout.add_row(Panel(
+            self.progress,
+            title=f"Current Album: {self.current_album or 'None'}",
+            border_style="panel.border",
+            title_align="center"
+        ))
         
-        return Panel(layout, title="Bunkrr Downloader", border_style="cyan")
+        return Panel(
+            layout,
+            title="[summary.title]Bunkrr Downloader",
+            border_style="panel.border",
+            padding=(1, 2)
+        )
     
     def _show_summary(self):
-        """Show download summary."""
+        """Show download summary with enhanced formatting."""
         summary = Table.grid(padding=1)
         summary.add_row(
             Text("Total Files:", style="stats"),
-            Text(str(self.stats.total_files), style="info")
+            Text(str(self.stats.total_files), style="stats.value")
         )
         summary.add_row(
             Text("Successfully Downloaded:", style="stats"),
-            Text(str(self.stats.completed_files), style="success")
+            Text(str(self.stats.completed_files), style="summary.success")
         )
         summary.add_row(
             Text("Failed:", style="stats"),
-            Text(str(self.stats.failed_files), style="error")
+            Text(str(self.stats.failed_files), style="summary.error")
         )
         summary.add_row(
             Text("Total Downloaded:", style="stats"),
-            Text(f"{self.stats.downloaded_size / 1024 / 1024:.1f} MB", style="info")
+            Text(self.stats.formatted_downloaded_size, style="summary.info")
         )
         summary.add_row(
             Text("Total Time:", style="stats"),
-            Text(f"{self.stats.elapsed_time:.1f}s", style="info")
+            Text(self.stats.formatted_elapsed_time, style="stats.value")
         )
         summary.add_row(
             Text("Success Rate:", style="stats"),
-            Text(f"{self.stats.success_rate:.1f}%", style="info")
+            Text(f"{self.stats.success_rate:.1f}%",
+                 style="summary.success" if self.stats.success_rate > 90 else "summary.error")
         )
         
         self.console.print("\n")
         self.console.print(Panel(
-            summary,
-            title="Download Summary",
-            border_style="cyan"
+            Align.center(summary),
+            title="[summary.title]Download Summary",
+            border_style="panel.border",
+            padding=(1, 2)
         )) 

@@ -77,24 +77,41 @@ class DownloadStats:
         }
 
 class RateTracker:
-    """Track rate of operations over time."""
+    """Track rate of operations over time with enhanced monitoring."""
     
     def __init__(self, window_size: int = 60):
         """Initialize rate tracker with window size in seconds."""
         self.window_size = window_size
         self._events: List[Tuple[float, int]] = []
-    
-    def add_event(self, count: int = 1) -> None:
-        """Add event occurrence."""
+        self._wait_times: List[Tuple[float, float]] = []  # (timestamp, wait_time)
+        self._rate_limit_hits = 0
+        self._last_cleanup = time.time()
+        
+    def add_event(self, count: int = 1, wait_time: Optional[float] = None) -> None:
+        """Add event occurrence with optional wait time."""
         now = time.time()
         self._events.append((now, count))
-        self._cleanup(now)
+        
+        if wait_time is not None and wait_time > 0:
+            self._wait_times.append((now, wait_time))
+            self._rate_limit_hits += 1
+            
+        # Periodic cleanup
+        if now - self._last_cleanup >= 5.0:  # Cleanup every 5 seconds
+            self._cleanup(now)
+            self._last_cleanup = now
     
     def _cleanup(self, now: float) -> None:
         """Remove events outside window."""
         cutoff = now - self.window_size
+        
+        # Clean up events
         while self._events and self._events[0][0] < cutoff:
             self._events.pop(0)
+            
+        # Clean up wait times
+        while self._wait_times and self._wait_times[0][0] < cutoff:
+            self._wait_times.pop(0)
     
     def get_rate(self) -> float:
         """Calculate current rate per second."""
@@ -111,6 +128,33 @@ class RateTracker:
             return 0.0
             
         return total / window
+    
+    def get_wait_time_stats(self) -> Dict[str, float]:
+        """Get statistics about rate limit wait times."""
+        if not self._wait_times:
+            return {
+                'avg_wait': 0.0,
+                'max_wait': 0.0,
+                'rate_limit_hits': 0,
+                'rate_limit_ratio': 0.0
+            }
+            
+        wait_times = [wt for _, wt in self._wait_times]
+        total_requests = len(self._events)
+        
+        return {
+            'avg_wait': sum(wait_times) / len(wait_times),
+            'max_wait': max(wait_times),
+            'rate_limit_hits': self._rate_limit_hits,
+            'rate_limit_ratio': self._rate_limit_hits / total_requests if total_requests > 0 else 0.0
+        }
+    
+    def reset(self) -> None:
+        """Reset all tracking data."""
+        self._events.clear()
+        self._wait_times.clear()
+        self._rate_limit_hits = 0
+        self._last_cleanup = time.time()
 
 class ProgressTracker:
     """Track progress of operations."""

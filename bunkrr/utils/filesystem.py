@@ -36,8 +36,12 @@ def get_unique_path(path: Path) -> Path:
         
     parent = path.parent
     stem = path.stem
-    suffix = path.suffix
+    suffix = path.suffix if not path.is_dir() else ""
     counter = 1
+    
+    # If it's a directory and empty, return it
+    if path.is_dir() and not any(path.iterdir()):
+        return path
     
     while True:
         new_path = parent / f"{stem}_{counter}{suffix}"
