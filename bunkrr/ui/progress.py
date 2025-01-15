@@ -2,8 +2,10 @@
 from dataclasses import dataclass
 from datetime import datetime
 import threading
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import humanize
+import json
+import time
 
 from rich.console import Console
 from rich.live import Live
@@ -24,6 +26,9 @@ from rich.text import Text
 from rich.align import Align
 
 from .themes import DEFAULT_THEME
+from ..core.logger import setup_logger
+
+logger = setup_logger('bunkrr.progress')
 
 @dataclass
 class DownloadStats:
@@ -36,11 +41,29 @@ class DownloadStats:
     current_speed: float = 0.0
     start_time: Optional[datetime] = None
     
+    # Track performance metrics
+    download_speeds: List[float] = None
+    download_times: List[float] = None
+    failure_timestamps: List[float] = None
+    
+    def __post_init__(self):
+        """Initialize tracking lists."""
+        self.download_speeds = []
+        self.download_times = []
+        self.failure_timestamps = []
+    
     @property
     def success_rate(self) -> float:
         """Calculate success rate."""
         total = self.completed_files + self.failed_files
-        return (self.completed_files / total * 100) if total > 0 else 0
+        rate = (self.completed_files / total * 100) if total > 0 else 0
+        logger.debug(
+            "Success rate calculated - Completed: %d, Failed: %d, Rate: %.2f%%",
+            self.completed_files,
+            self.failed_files,
+            rate
+        )
+        return rate
         
     @property
     def elapsed_time(self) -> float:
@@ -58,6 +81,27 @@ class DownloadStats:
     def formatted_elapsed_time(self) -> str:
         """Format elapsed time in human readable format."""
         return humanize.naturaldelta(self.elapsed_time)
+    
+    def get_performance_stats(self) -> Dict:
+        """Get detailed performance statistics."""
+        stats = {
+            'avg_speed': sum(self.download_speeds) / len(self.download_speeds) if self.download_speeds else 0,
+            'max_speed': max(self.download_speeds) if self.download_speeds else 0,
+            'min_speed': min(self.download_speeds) if self.download_speeds else 0,
+            'avg_download_time': sum(self.download_times) / len(self.download_times) if self.download_times else 0,
+            'max_download_time': max(self.download_times) if self.download_times else 0,
+            'min_download_time': min(self.download_times) if self.download_times else 0,
+            'failure_rate_per_minute': (
+                len(self.failure_timestamps) * 60 / self.elapsed_time
+                if self.elapsed_time > 0 else 0
+            )
+        }
+        
+        logger.debug(
+            "Performance stats calculated: %s",
+            json.dumps(stats, indent=2)
+        )
+        return stats
 
 class ProgressTracker:
     """Singleton progress tracker for unified progress tracking."""
@@ -68,6 +112,7 @@ class ProgressTracker:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
+                logger.info("Created new ProgressTracker instance")
             return cls._instance
     
     def __init__(self):
@@ -79,6 +124,7 @@ class ProgressTracker:
             self.live = None
             self._setup_progress_bars()
             self.initialized = True
+            logger.info("Initialized ProgressTracker")
     
     def _setup_progress_bars(self):
         """Set up progress bars with enhanced columns."""
@@ -128,6 +174,10 @@ class ProgressTracker:
                 transient=True
             )
             self.live.start()
+            logger.info(
+                "Started progress tracking at %s",
+                self.stats.start_time.isoformat()
+            )
     
     def stop(self):
         """Stop progress tracking and show summary."""
@@ -135,6 +185,22 @@ class ProgressTracker:
             self.live.stop()
             self._show_summary()
             self.live = None
+            
+            # Log final statistics
+            performance_stats = self.stats.get_performance_stats()
+            logger.info(
+                "Download session completed - Stats: %s",
+                json.dumps({
+                    'total_files': self.stats.total_files,
+                    'completed_files': self.stats.completed_files,
+                    'failed_files': self.stats.failed_files,
+                    'total_size': self.stats.total_size,
+                    'downloaded_size': self.stats.downloaded_size,
+                    'elapsed_time': self.stats.elapsed_time,
+                    'success_rate': self.stats.success_rate,
+                    'performance': performance_stats
+                }, indent=2)
+            )
     
     def update_album(self, album_name: str, total_files: int):
         """Update current album information."""
@@ -152,18 +218,59 @@ class ProgressTracker:
         
         if self.live:
             self.live.update(self._generate_layout())
+        
+        logger.info(
+            "Started processing album - Name: %s, Files: %d, Total files: %d",
+            album_name,
+            total_files,
+            self.stats.total_files
+        )
     
     def update_progress(self, advance: int = 1, downloaded: int = 0, failed: bool = False):
         """Update download progress."""
+        start_time = time.time()
+        
         if failed:
             self.stats.failed_files += advance
+            self.stats.failure_timestamps.append(time.time())
+            logger.warning(
+                "Download failed - Album: %s, Failed count: %d",
+                self.current_album,
+                self.stats.failed_files
+            )
         else:
             self.stats.completed_files += advance
             self.stats.downloaded_size += downloaded
             
+            # Track performance metrics
+            download_time = time.time() - start_time
+            speed = downloaded / download_time if download_time > 0 else 0
+            
+            self.stats.download_times.append(download_time)
+            self.stats.download_speeds.append(speed)
+            
+            logger.debug(
+                "Download completed - Album: %s, Size: %s, Speed: %.2f MB/s, Time: %.2fs",
+                self.current_album,
+                humanize.naturalsize(downloaded, binary=True),
+                speed / (1024 * 1024),
+                download_time
+            )
+            
         if self.current_task_id:
             self.progress.update(self.current_task_id, advance=advance)
         self.total_progress.update(self.total_task_id, advance=advance)
+        
+        # Log progress periodically
+        if (self.stats.completed_files + self.stats.failed_files) % 10 == 0:
+            logger.info(
+                "Download progress - Completed: %d, Failed: %d, Success rate: %.2f%%, "
+                "Downloaded: %s",
+                self.stats.completed_files,
+                self.stats.failed_files,
+                self.stats.success_rate,
+                self.stats.formatted_downloaded_size
+            )
         
         if self.live:
             self.live.update(self._generate_layout())

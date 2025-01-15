@@ -4,11 +4,16 @@ import signal
 import sys
 import os
 from pathlib import Path
-from typing import Generator, List, Optional, Dict, Any, Set, Union, Callable, TypeVar, Iterator
+from typing import Generator, List, Optional, Dict, Any, Set, Union, Callable, TypeVar, Iterator, Counter
 from urllib.parse import urljoin, urlparse
 import random
 import atexit
 import re
+import time
+import uuid
+from datetime import datetime
+import traceback
+from collections import Counter
 
 from scrapy import Spider, Request
 from scrapy.http import Response
@@ -147,6 +152,10 @@ class BunkrSpider(Spider):
         self._shutdown_requested = False
         self._cleanup_registered = False
         
+        # Initialize request tracking
+        self._request_times: Dict[str, float] = {}
+        self._request_sizes: Dict[str, int] = {}
+        
         # Verify download directory
         try:
             self.parent_folder.mkdir(parents=True, exist_ok=True)
@@ -165,6 +174,20 @@ class BunkrSpider(Spider):
         
         # Set up signal handlers and cleanup
         self._setup_handlers()
+        
+        # Initialize error tracking
+        self._error_counts = Counter()
+        self._error_timestamps: List[float] = []
+        self._error_window = 300  # 5 minutes
+        self._max_error_rate = 0.3  # 30% error rate threshold
+        
+        # Track parsing errors separately
+        self._parsing_errors = {
+            'album': Counter(),
+            'media': Counter(),
+            'selector': Counter(),
+            'network': Counter()
+        }
         
         logger.info(
             "Initialized BunkrSpider with parent_folder: %s, start_urls: %s",
@@ -256,6 +279,22 @@ class BunkrSpider(Spider):
         headers = self.get_headers()
         if meta is None:
             meta = {}
+        
+        # Add correlation ID and timing info
+        request_id = str(uuid.uuid4())
+        meta.update({
+            'request_id': request_id,
+            'start_time': time.time(),
+            'request_url': url,
+            'spider_name': self.name
+        })
+        
+        logger.debug(
+            "Creating request [%s] - URL: %s, Headers: %s",
+            request_id,
+            url,
+            json.dumps(headers)
+        )
         
         return Request(
             url=url,
@@ -491,23 +530,88 @@ class BunkrSpider(Spider):
     def _handle_media_success(self):
         """Handle successful media extraction."""
         self.media_count += 1
+        logger.info(
+            "Media extraction successful - Total successful: %d, Total failed: %d",
+            self.media_count,
+            self.failed_count
+        )
         if self.progress_tracker:
             self.progress_tracker.update(completed=1)
 
     def _handle_media_failure(self, response: Response):
         """Handle media extraction failure."""
-        logger.debug("Response body: %s", response.text[:1000])
+        request_id = response.meta.get('request_id', 'unknown')
+        error_msg = f"Failed to extract media from {response.url}"
+        
+        # Track parsing error
+        self._track_error('media', 'extraction_failed', error_msg)
+        
+        logger.error(
+            "Media extraction failed [%s] - URL: %s\n"
+            "Status: %d\nHeaders: %s\nBody Preview: %s",
+            request_id,
+            response.url,
+            response.status,
+            json.dumps(dict(response.headers)),
+            response.text[:1000]
+        )
+        
         if self.progress_tracker:
             self.progress_tracker.update(failed=1)
         self.failed_count += 1
     
     def handle_error(self, failure):
         """Handle request failures."""
+        request = failure.request
+        request_id = request.meta.get('request_id', 'unknown')
+        start_time = request.meta.get('start_time', time.time())
+        duration = time.time() - start_time
+        
+        # Extract error details
+        error_type = type(failure.value).__name__
+        error_msg = str(failure.value)
+        tb_str = ''.join(traceback.format_tb(failure.getTracebackObject())) if failure.getTracebackObject() else ''
+        
+        # Categorize error
+        if 'timeout' in error_msg.lower():
+            error_subtype = 'timeout'
+        elif 'connection' in error_msg.lower():
+            error_subtype = 'connection'
+        elif 'dns' in error_msg.lower():
+            error_subtype = 'dns'
+        else:
+            error_subtype = 'unknown'
+        
+        # Create structured error
         error = ScrapyError(
-            message=str(failure.value),
+            message=error_msg,
             spider_name=self.name,
-            url=failure.request.url,
-            details=str(failure.getTracebackObject()) if failure.getTracebackObject() else None
+            url=request.url,
+            details={
+                'error_type': error_type,
+                'error_subtype': error_subtype,
+                'traceback': tb_str,
+                'request_id': request_id,
+                'duration': duration,
+                'headers': request.headers
+            }
+        )
+        
+        # Track and log error
+        self._track_error('network', error_subtype, error_msg)
+        
+        logger.error(
+            "Request failed [%s] - Type: %s, Subtype: %s\n"
+            "URL: %s\nDuration: %.2fs\nError: %s\n"
+            "Headers: %s\nTraceback:\n%s",
+            request_id,
+            error_type,
+            error_subtype,
+            request.url,
+            duration,
+            error_msg,
+            json.dumps(dict(request.headers)),
+            tb_str
         )
         
         ErrorHandler.handle_error(error, context="spider_request", reraise=False)
@@ -534,27 +638,69 @@ class BunkrSpider(Spider):
         if not self.running:
             return None
         
+        request_id = response.meta.get('request_id', 'unknown')
+        start_time = response.meta.get('start_time', time.time())
+        duration = time.time() - start_time
+        
+        logger.info(
+            "Received response [%s] - URL: %s, Status: %d, Size: %d bytes, Duration: %.2fs",
+            request_id,
+            response.url,
+            response.status,
+            len(response.body),
+            duration
+        )
+        
         try:
             # Extract album ID from URL
             album_match = ALBUM_ID_PATTERN.search(response.url)
             if album_match:
+                logger.debug(
+                    "Processing album [%s] - Album ID: %s",
+                    request_id,
+                    album_match.group(1)
+                )
                 return self._parse_album(response)
             
             # Extract media ID from URL
             media_match = MEDIA_ID_PATTERN.search(response.url)
             if media_match:
+                logger.debug(
+                    "Processing media [%s] - Media ID: %s",
+                    request_id,
+                    media_match.group(1)
+                )
                 return self._parse_media(response)
             
-            logger.warning("URL %s doesn't match any known patterns", response.url)
+            logger.warning(
+                "URL doesn't match any known patterns [%s] - URL: %s",
+                request_id,
+                response.url
+            )
             return None
             
         except Exception as e:
-            logger.error("Error parsing %s: %s", response.url, str(e))
+            logger.error(
+                "Error parsing response [%s] - URL: %s, Error: %s",
+                request_id,
+                response.url,
+                str(e),
+                exc_info=True
+            )
             self._handle_media_failure(response)
             return None
     
     def _parse_album(self, response: Response) -> Dict[str, Any]:
         """Parse album page."""
+        request_id = response.meta.get('request_id', 'unknown')
+        start_time = time.time()
+        
+        logger.info(
+            "Starting album parsing [%s] - URL: %s",
+            request_id,
+            response.url
+        )
+        
         soup = BeautifulSoup(response.text, 'lxml', parse_only=ALBUM_STRAINER)
         result = self._result_pool.get()
         
@@ -563,16 +709,37 @@ class BunkrSpider(Spider):
             meta_title = soup.find('meta', property='og:title')
             if meta_title and meta_title.get('content'):
                 result['title'] = meta_title['content']
+                logger.debug(
+                    "Found album meta title [%s] - Title: %s",
+                    request_id,
+                    result['title']
+                )
             
             # Extract h1 title
             h1_title = soup.find('h1', class_='truncate')
             if h1_title:
                 result['header'] = h1_title.get_text(strip=True)
+                logger.debug(
+                    "Found album header [%s] - Header: %s",
+                    request_id,
+                    result['header']
+                )
             
             # Extract media items
             media_items = []
+            item_count = 0
+            total_size = 0
+            
             for item in soup.find_all('div', class_='theItem'):
+                item_count += 1
                 media_item = self._result_pool.get()
+                item_start = time.time()
+                
+                logger.debug(
+                    "Processing media item %d [%s]",
+                    item_count,
+                    request_id
+                )
                 
                 # Extract file info
                 filename = item.find('p', style='display:none;')
@@ -582,6 +749,22 @@ class BunkrSpider(Spider):
                 size = item.find('p', class_='theSize')
                 if size:
                     media_item['size'] = size.get_text(strip=True)
+                    try:
+                        # Convert size string to bytes for tracking
+                        size_str = size.get_text(strip=True).lower()
+                        if 'mb' in size_str:
+                            size_bytes = float(size_str.replace('mb', '')) * 1024 * 1024
+                        elif 'kb' in size_str:
+                            size_bytes = float(size_str.replace('kb', '')) * 1024
+                        else:
+                            size_bytes = float(size_str)
+                        total_size += size_bytes
+                    except (ValueError, AttributeError):
+                        logger.warning(
+                            "Could not parse file size [%s] - Size string: %s",
+                            request_id,
+                            size_str
+                        )
                 
                 date = item.find('span', class_='theDate')
                 if date:
@@ -591,17 +774,54 @@ class BunkrSpider(Spider):
                 if thumbnail and thumbnail.get('src'):
                     media_item['thumbnail'] = thumbnail['src']
                 
+                item_duration = time.time() - item_start
+                logger.debug(
+                    "Media item %d processed [%s] - Duration: %.2fs, Filename: %s, Size: %s",
+                    item_count,
+                    request_id,
+                    item_duration,
+                    media_item.get('filename', 'unknown'),
+                    media_item.get('size', 'unknown')
+                )
+                
                 media_items.append(media_item)
             
             result['media_items'] = media_items
+            
+            duration = time.time() - start_time
+            logger.info(
+                "Album parsing completed [%s] - Items: %d, Total Size: %.2f MB, Duration: %.2fs",
+                request_id,
+                item_count,
+                total_size / (1024 * 1024),
+                duration
+            )
+            
             return result
             
         except Exception as e:
+            duration = time.time() - start_time
+            logger.error(
+                "Album parsing failed [%s] - Duration: %.2fs, Error: %s",
+                request_id,
+                duration,
+                str(e),
+                exc_info=True
+            )
             self._result_pool.put(result)
             raise SpiderError(f"Failed to parse album: {e}")
     
     def _parse_media(self, response: Response) -> Dict[str, Any]:
         """Parse media page."""
+        request_id = response.meta.get('request_id', 'unknown')
+        start_time = time.time()
+        
+        logger.info(
+            "Starting media parsing [%s] - URL: %s",
+            request_id,
+            response.url
+        )
+        
         soup = BeautifulSoup(response.text, 'lxml', parse_only=MEDIA_STRAINER)
         result = self._result_pool.get()
         
@@ -610,17 +830,118 @@ class BunkrSpider(Spider):
             img = soup.find('img', class_='grid-images_box-img')
             if img and img.get('src'):
                 result['url'] = img['src']
+                logger.debug(
+                    "Found media URL [%s] - URL: %s",
+                    request_id,
+                    result['url']
+                )
             
             size = soup.find('p', class_='theSize')
             if size:
                 result['size'] = size.get_text(strip=True)
+                logger.debug(
+                    "Found media size [%s] - Size: %s",
+                    request_id,
+                    result['size']
+                )
             
             date = soup.find('span', class_='theDate')
             if date:
                 result['date'] = date.get_text(strip=True)
+                logger.debug(
+                    "Found media date [%s] - Date: %s",
+                    request_id,
+                    result['date']
+                )
+            
+            duration = time.time() - start_time
+            logger.info(
+                "Media parsing completed [%s] - Size: %s, Duration: %.2fs",
+                request_id,
+                result.get('size', 'unknown'),
+                duration
+            )
             
             return result
             
         except Exception as e:
+            duration = time.time() - start_time
+            logger.error(
+                "Media parsing failed [%s] - Duration: %.2fs, Error: %s",
+                request_id,
+                duration,
+                str(e),
+                exc_info=True
+            )
             self._result_pool.put(result)
             raise SpiderError(f"Failed to parse media: {e}")
+
+    def _track_error(self, error_type: str, error_subtype: str, error_msg: str) -> None:
+        """Track error occurrence and check error rate."""
+        current_time = time.time()
+        
+        # Add error to counters
+        self._error_counts[error_type] += 1
+        if error_type in self._parsing_errors:
+            self._parsing_errors[error_type][error_subtype] += 1
+        
+        # Add timestamp and clean old ones
+        self._error_timestamps.append(current_time)
+        self._error_timestamps = [t for t in self._error_timestamps 
+                                if current_time - t <= self._error_window]
+        
+        # Calculate error rate
+        error_rate = len(self._error_timestamps) / (
+            self.media_count + self.failed_count
+        ) if (self.media_count + self.failed_count) > 0 else 0
+        
+        logger.error(
+            "Error occurred - Type: %s, Subtype: %s, Message: %s, "
+            "Count: %d, Rate: %.2f%%, Window: %d seconds",
+            error_type,
+            error_subtype,
+            error_msg,
+            self._error_counts[error_type],
+            error_rate * 100,
+            self._error_window
+        )
+        
+        # Log error frequency statistics periodically
+        if len(self._error_timestamps) % 10 == 0:  # Every 10 errors
+            self._log_error_stats()
+        
+        # Check if error rate exceeds threshold
+        if error_rate > self._max_error_rate:
+            logger.critical(
+                "Error rate %.2f%% exceeds threshold %.2f%% - "
+                "Consider implementing backoff or circuit breaking",
+                error_rate * 100,
+                self._max_error_rate * 100
+            )
+
+    def _log_error_stats(self) -> None:
+        """Log error statistics."""
+        logger.info("Error Statistics:")
+        
+        # Log general error counts
+        for error_type, count in self._error_counts.most_common():
+            logger.info("  %s: %d occurrences", error_type, count)
+        
+        # Log detailed parsing errors
+        for category, errors in self._parsing_errors.items():
+            if errors:
+                logger.info("  %s errors:", category.title())
+                for subtype, count in errors.most_common(5):  # Top 5 most common
+                    logger.info("    - %s: %d occurrences", subtype, count)
+
+    def _handle_selector_error(self, selector: str, context: str, request_id: str) -> None:
+        """Handle selector failures."""
+        error_msg = f"Selector '{selector}' failed in context '{context}'"
+        self._track_error('selector', context, error_msg)
+        
+        logger.warning(
+            "Selector failed [%s] - Selector: %s, Context: %s",
+            request_id,
+            selector,
+            context
+        )

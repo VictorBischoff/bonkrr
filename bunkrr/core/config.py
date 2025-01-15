@@ -30,15 +30,91 @@ See Also:
     - bunkrr.core.exceptions: Configuration-related exceptions
     - bunkrr.core.logger: Logging utilities
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, Any, Optional, ClassVar
+from typing import Dict, Any, Optional, ClassVar, List
 from enum import Enum
+import json
+import time
 
 from .exceptions import ConfigError, ConfigVersionError
 from .logger import setup_logger
 
 logger = setup_logger('bunkrr.config')
+
+class ConfigValidationTracker:
+    """Track configuration validation and changes."""
+    
+    def __init__(self):
+        self.validation_count = 0
+        self.validation_errors: List[Dict[str, Any]] = []
+        self.last_validation = None
+        self.changes: List[Dict[str, Any]] = []
+    
+    def add_validation(self, success: bool, config_type: str, details: Optional[Dict[str, Any]] = None) -> None:
+        """Record validation attempt."""
+        self.validation_count += 1
+        timestamp = time.time()
+        
+        if not success:
+            self.validation_errors.append({
+                'timestamp': timestamp,
+                'config_type': config_type,
+                'details': details or {}
+            })
+        
+        self.last_validation = {
+            'timestamp': timestamp,
+            'success': success,
+            'config_type': config_type,
+            'details': details or {}
+        }
+        
+        logger.debug(
+            "Configuration validation - Type: %s, Success: %s, Details: %s",
+            config_type,
+            success,
+            json.dumps(details or {})
+        )
+    
+    def add_change(self, config_type: str, field: str, old_value: Any, new_value: Any) -> None:
+        """Record configuration change."""
+        change = {
+            'timestamp': time.time(),
+            'config_type': config_type,
+            'field': field,
+            'old_value': old_value,
+            'new_value': new_value
+        }
+        self.changes.append(change)
+        
+        logger.info(
+            "Configuration changed - Type: %s, Field: %s, Old: %s, New: %s",
+            config_type,
+            field,
+            old_value,
+            new_value
+        )
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get validation statistics."""
+        stats = {
+            'validation_count': self.validation_count,
+            'error_count': len(self.validation_errors),
+            'change_count': len(self.changes),
+            'last_validation': self.last_validation,
+            'recent_changes': self.changes[-5:] if self.changes else [],
+            'recent_errors': self.validation_errors[-5:] if self.validation_errors else []
+        }
+        
+        logger.debug(
+            "Configuration stats - %s",
+            json.dumps(stats, indent=2)
+        )
+        return stats
+
+# Global validation tracker
+config_tracker = ConfigValidationTracker()
 
 class ConfigVersion(Enum):
     """Configuration version enumeration.
@@ -70,7 +146,9 @@ class ConfigVersion(Enum):
             >>> latest = ConfigVersion.latest()
             >>> assert latest == ConfigVersion.V1_1
         """
-        return cls.V1_1
+        latest = cls.V1_1
+        logger.debug("Latest config version: %s", latest.value)
+        return latest
 
 @dataclass
 class ScrapyConfig:
@@ -143,6 +221,14 @@ class ScrapyConfig:
     TWISTED_REACTOR: str = 'twisted.internet.asyncio.AsyncioSelectorReactor'
     ASYNCIO_EVENT_LOOP: str = 'uvloop.EventLoop'
     
+    def __post_init__(self):
+        """Validate settings after initialization."""
+        logger.info(
+            "Initializing ScrapyConfig - Version: %s",
+            self.VERSION.value
+        )
+        self.validate()
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for Scrapy settings.
         
@@ -155,11 +241,60 @@ class ScrapyConfig:
             >>> print(settings['COMPRESSION_ENABLED'])
             True
         """
-        return {
+        settings = {
             key: getattr(self, key)
             for key in self.__dataclass_fields__
             if not key.startswith('_')
         }
+        
+        logger.debug(
+            "Converted ScrapyConfig to dict - Settings: %s",
+            json.dumps(settings)
+        )
+        return settings
+    
+    def validate(self) -> None:
+        """Validate configuration settings.
+        
+        Raises:
+            ConfigError: If any settings are invalid
+        """
+        try:
+            # Validate concurrency settings
+            if self.CONCURRENT_REQUESTS < 1:
+                raise ConfigError("CONCURRENT_REQUESTS must be at least 1")
+            if self.CONCURRENT_REQUESTS_PER_DOMAIN < 1:
+                raise ConfigError("CONCURRENT_REQUESTS_PER_DOMAIN must be at least 1")
+            if self.CONCURRENT_ITEMS < 1:
+                raise ConfigError("CONCURRENT_ITEMS must be at least 1")
+            
+            # Validate timeout settings
+            if self.DOWNLOAD_TIMEOUT < 1:
+                raise ConfigError("DOWNLOAD_TIMEOUT must be at least 1")
+            if self.RETRY_TIMES < 0:
+                raise ConfigError("RETRY_TIMES must be non-negative")
+            
+            # Validate cache settings
+            if self.DNSCACHE_SIZE < 100:
+                raise ConfigError("DNSCACHE_SIZE must be at least 100")
+            if self.HTTPCACHE_EXPIRATION_SECS < 0:
+                raise ConfigError("HTTPCACHE_EXPIRATION_SECS must be non-negative")
+            
+            config_tracker.add_validation(True, 'ScrapyConfig', asdict(self))
+            logger.info("ScrapyConfig validation successful")
+            
+        except ConfigError as e:
+            details = {
+                'error': str(e),
+                'config': asdict(self)
+            }
+            config_tracker.add_validation(False, 'ScrapyConfig', details)
+            logger.error(
+                "ScrapyConfig validation failed - Error: %s, Config: %s",
+                str(e),
+                json.dumps(asdict(self))
+            )
+            raise
 
     @classmethod
     def migrate_from(cls, old_config: Dict[str, Any], old_version: str) -> 'ScrapyConfig':
@@ -186,14 +321,26 @@ class ScrapyConfig:
         """
         try:
             old_ver = ConfigVersion(old_version)
+            logger.info(
+                "Migrating ScrapyConfig - From version: %s, To version: %s",
+                old_version,
+                cls.VERSION.value
+            )
+            
+            if old_ver == cls.VERSION:
+                return cls(**old_config)
+            
+            # Add migration logic here as new versions are introduced
+            raise ConfigVersionError(f"Migration from version {old_version} is not supported")
+            
         except ValueError:
-            raise ConfigVersionError(f"Unknown configuration version: {old_version}")
-            
-        if old_ver == cls.VERSION:
-            return cls(**old_config)
-            
-        # Add migration logic here as new versions are introduced
-        raise ConfigVersionError(f"Migration from version {old_version} is not supported")
+            error = f"Unknown configuration version: {old_version}"
+            logger.error(
+                "ScrapyConfig migration failed - Error: %s, Old config: %s",
+                error,
+                json.dumps(old_config)
+            )
+            raise ConfigVersionError(error)
 
 @dataclass
 class DownloadConfig:
@@ -220,6 +367,68 @@ class DownloadConfig:
     # Scrapy integration
     scrapy: ScrapyConfig = field(default_factory=ScrapyConfig)
     
+    def __post_init__(self):
+        """Validate settings after initialization."""
+        logger.info(
+            "Initializing DownloadConfig - Version: %s",
+            self.VERSION.value
+        )
+        self.validate()
+    
+    def validate(self) -> None:
+        """Validate configuration settings.
+        
+        Raises:
+            ConfigError: If any settings are invalid
+        """
+        try:
+            # Core settings validation
+            if self.max_concurrent_downloads < 1:
+                raise ConfigError("max_concurrent_downloads must be at least 1")
+            if self.chunk_size < 1024:  # 1KB minimum
+                raise ConfigError("chunk_size must be at least 1KB")
+            if self.buffer_size < self.chunk_size:
+                raise ConfigError("buffer_size must be at least as large as chunk_size")
+            
+            # Timeout validation
+            if self.connect_timeout < 1:
+                raise ConfigError("connect_timeout must be at least 1 second")
+            if self.read_timeout < 1:
+                raise ConfigError("read_timeout must be at least 1 second")
+            if self.total_timeout < max(self.connect_timeout, self.read_timeout):
+                raise ConfigError("total_timeout must be at least as large as the largest timeout")
+            
+            # Rate limiting validation
+            if self.window_size < 1:
+                raise ConfigError("window_size must be at least 1 second")
+            if self.requests_per_window < 1:
+                raise ConfigError("requests_per_window must be at least 1")
+            
+            # Cache validation
+            if self.dns_cache_ttl < 0:
+                raise ConfigError("dns_cache_ttl must be non-negative")
+            if self.url_cache_size < 1:
+                raise ConfigError("url_cache_size must be at least 1")
+            
+            # Validate Scrapy config
+            self.scrapy.validate()
+            
+            config_tracker.add_validation(True, 'DownloadConfig', asdict(self))
+            logger.info("DownloadConfig validation successful")
+            
+        except ConfigError as e:
+            details = {
+                'error': str(e),
+                'config': asdict(self)
+            }
+            config_tracker.add_validation(False, 'DownloadConfig', details)
+            logger.error(
+                "DownloadConfig validation failed - Error: %s, Config: %s",
+                str(e),
+                json.dumps(asdict(self))
+            )
+            raise
+    
     @classmethod
     def migrate_from(cls, old_config: Dict[str, Any], old_version: str) -> 'DownloadConfig':
         """Migrate configuration from an older version.
@@ -236,28 +445,23 @@ class DownloadConfig:
         """
         try:
             old_ver = ConfigVersion(old_version)
+            logger.info(
+                "Migrating DownloadConfig - From version: %s, To version: %s",
+                old_version,
+                cls.VERSION.value
+            )
+            
+            if old_ver == cls.VERSION:
+                return cls(**old_config)
+            
+            # Add migration logic here as new versions are introduced
+            raise ConfigVersionError(f"Migration from version {old_version} is not supported")
+            
         except ValueError:
-            raise ConfigVersionError(f"Unknown configuration version: {old_version}")
-            
-        if old_ver == cls.VERSION:
-            return cls(**old_config)
-            
-        # Add migration logic here as new versions are introduced
-        raise ConfigVersionError(f"Migration from version {old_version} is not supported")
-        
-    def validate(self) -> None:
-        """Validate configuration settings.
-        
-        Raises:
-            ConfigError: If any settings are invalid
-        """
-        if self.max_concurrent_downloads < 1:
-            raise ConfigError("max_concurrent_downloads must be at least 1")
-        if self.chunk_size < 1024:  # 1KB minimum
-            raise ConfigError("chunk_size must be at least 1KB")
-        if self.buffer_size < self.chunk_size:
-            raise ConfigError("buffer_size must be at least as large as chunk_size")
-        if self.window_size < 1:
-            raise ConfigError("window_size must be at least 1 second")
-        if self.requests_per_window < 1:
-            raise ConfigError("requests_per_window must be at least 1") 
+            error = f"Unknown configuration version: {old_version}"
+            logger.error(
+                "DownloadConfig migration failed - Error: %s, Old config: %s",
+                error,
+                json.dumps(old_config)
+            )
+            raise ConfigVersionError(error) 
