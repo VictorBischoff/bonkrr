@@ -1,53 +1,28 @@
 """Data utilities for the bunkrr package."""
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union
+import json
+import logging
 import math
 import mimetypes
-import os
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple, Union, Any, Callable
+from collections import deque
 
 from rich.console import Console
 from rich.progress import (
-    BarColumn,
-    DownloadColumn,
     Progress,
     SpinnerColumn,
     TextColumn,
-    TimeRemainingColumn,
-    TransferSpeedColumn
+    BarColumn,
+    DownloadColumn,
+    TransferSpeedColumn,
+    TimeRemainingColumn
 )
-from rich.table import Table
 
 from ..core.logger import setup_logger
 
 logger = setup_logger('bunkrr.data')
-
-# Initialize mimetypes
-mimetypes.init()
-
-# Common media extensions
-MEDIA_EXTENSIONS: Set[str] = {
-    # Images
-    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff',
-    # Videos
-    '.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv',
-    # Archives
-    '.zip', '.rar', '.7z', '.tar', '.gz'
-}
-
-@dataclass
-class ProgressData:
-    """Progress tracking data."""
-    current: int
-    total: int
-    description: str
-    start_time: float
-    
-    @property
-    def percentage(self) -> float:
-        """Calculate progress percentage."""
-        return (self.current / self.total * 100) if self.total else 0
 
 @dataclass
 class DownloadStats:
@@ -100,10 +75,10 @@ class DownloadStats:
         return self.bytes_downloaded / elapsed
     
     def add_error(self, error: str) -> None:
-        """Track error occurrence."""
+        """Add error occurrence."""
         self.errors[error] = self.errors.get(error, 0) + 1
     
-    def to_dict(self) -> Dict[str, any]:
+    def to_dict(self) -> Dict:
         """Convert stats to dictionary."""
         return {
             'total': self.total,
@@ -197,92 +172,10 @@ class RateTracker:
         self._rate_limit_hits = 0
         self._last_cleanup = time.time()
 
-class ProgressTracker:
-    """Track progress of operations."""
-    
-    def __init__(self):
-        """Initialize progress tracker."""
-        self.stats = DownloadStats()
-        self.rate_tracker = RateTracker()
-        self._last_update = 0.0
-    
-    def start(self) -> None:
-        """Start tracking progress."""
-        self.stats.start()
-        logger.info("Started progress tracking")
-    
-    def stop(self) -> None:
-        """Stop tracking progress."""
-        self.stats.stop()
-        logger.info(
-            "Completed tracking - Success rate: %.1f%%, "
-            "Average speed: %.2f MB/s",
-            self.stats.success_rate,
-            self.stats.average_speed / 1024 / 1024
-        )
-    
-    def update(
-        self,
-        completed: Optional[int] = None,
-        failed: Optional[int] = None,
-        skipped: Optional[int] = None,
-        bytes_downloaded: Optional[int] = None,
-        error: Optional[str] = None
-    ) -> None:
-        """Update progress stats."""
-        if completed:
-            self.stats.completed += completed
-            self.rate_tracker.add_event(completed)
-            
-        if failed:
-            self.stats.failed += failed
-            
-        if skipped:
-            self.stats.skipped += skipped
-            
-        if bytes_downloaded:
-            self.stats.bytes_downloaded += bytes_downloaded
-            
-        if error:
-            self.stats.add_error(error)
-            
-        # Log progress periodically
-        now = time.time()
-        if now - self._last_update >= 5.0:
-            self._log_progress()
-            self._last_update = now
-    
-    def _log_progress(self) -> None:
-        """Log current progress."""
-        if not self.stats.is_running:
-            return
-            
-        rate = self.rate_tracker.get_rate()
-        speed = self.stats.average_speed / 1024 / 1024  # MB/s
-        
-        logger.info(
-            "Progress: %d/%d (%.1f%%) - Rate: %.1f/s - Speed: %.2f MB/s",
-            self.stats.completed,
-            self.stats.total,
-            self.stats.success_rate,
-            rate,
-            speed
-        )
-        
-        if self.stats.errors:
-            logger.warning(
-                "Errors: %s",
-                ", ".join(
-                    f"{error}: {count}"
-                    for error, count in self.stats.errors.items()
-                )
-            )
-
-# Console instance for rich output
 console = Console()
 
 def format_size(size: Union[int, float]) -> str:
-    """Format size in bytes to human readable string."""
+    """Format size in human readable format."""
     if size < 0:
         raise ValueError("Size must be non-negative")
     if size == 0:
@@ -294,43 +187,20 @@ def format_size(size: Union[int, float]) -> str:
     
     return f"{size / (base ** i):.2f} {units[i]}"
 
-def format_time(seconds: Union[int, float]) -> str:
-    """Format time in seconds to human readable string."""
-    if seconds < 0:
-        raise ValueError("Time must be non-negative")
-    if seconds == 0:
-        return "0s"
-    
-    intervals: list[Tuple[str, int]] = [
-        ('d', 86400),
-        ('h', 3600),
-        ('m', 60),
-        ('s', 1)
-    ]
-    
-    parts = []
-    remaining = seconds
-    
-    for unit, count in intervals:
-        value = int(remaining // count)
-        if value > 0:
-            parts.append(f"{value}{unit}")
-            remaining %= count
-    
-    return " ".join(parts)
-
-def format_rate(rate: Union[int, float]) -> str:
-    """Format rate to human readable string."""
-    if rate < 0:
-        raise ValueError("Rate must be non-negative")
-    return "0/s" if rate == 0 else f"{format_size(rate)}/s"
+@dataclass
+class ProgressData:
+    """Progress data for callbacks."""
+    current: int
+    total: int
+    description: str
+    start_time: Optional[datetime] = None
 
 def create_progress_bar(
-    description: str = "Downloading",
+    description: str,
     total: Optional[int] = None,
-    callback: Optional[Callable[[ProgressData], None]] = None
+    callback: Optional[callable] = None
 ) -> Progress:
-    """Create rich progress bar with consistent styling."""
+    """Create a progress bar with optional callback."""
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
@@ -363,22 +233,13 @@ def get_media_type(filename: str) -> Optional[str]:
         mime_type, _ = mimetypes.guess_type(filename)
         if not mime_type:
             return None
-            
+        
         main_type = mime_type.split('/')[0]
         if main_type in {'image', 'video', 'application'}:
             return main_type
-            
+        
         return None
         
     except Exception as e:
         logger.error("Failed to get media type for %s: %s", filename, str(e))
-        return None
-
-def is_media_file(filename: str) -> bool:
-    """Check if filename has a media extension."""
-    try:
-        ext = os.path.splitext(filename)[1].lower()
-        return ext in MEDIA_EXTENSIONS
-    except Exception as e:
-        logger.error("Failed to check media file %s: %s", filename, str(e))
-        return False 
+        return None 

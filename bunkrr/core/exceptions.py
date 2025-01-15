@@ -113,6 +113,33 @@ class ConfigError(BunkrrError):
         )
         self.key = key
 
+class ConfigVersionError(ConfigError):
+    """Configuration version error."""
+    
+    def __init__(
+        self,
+        message: str,
+        version: Optional[str] = None,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize version error.
+        
+        Args:
+            message: Error message
+            version: Version string that caused the error
+            details: Optional error details
+            **kwargs: Additional error context
+        """
+        super().__init__(
+            message,
+            key='version',
+            details=details,
+            version=version,
+            **kwargs
+        )
+        self.version = version
+
 class ScrapyError(BunkrrError):
     """Scrapy spider error."""
     
@@ -137,6 +164,65 @@ class ScrapyError(BunkrrError):
         self.spider = spider
         self.url = url
         self.status_code = status_code
+
+class SpiderError(ScrapyError):
+    """Spider-specific error with enhanced context."""
+    
+    def __init__(
+        self,
+        message: str,
+        url: Optional[str] = None,
+        spider_name: Optional[str] = None,
+        status_code: Optional[int] = None,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize spider error.
+        
+        Args:
+            message: Error message
+            url: Optional URL that caused the error
+            spider_name: Optional name of the spider
+            status_code: Optional HTTP status code
+            details: Optional error details
+            **kwargs: Additional error context
+        """
+        super().__init__(
+            message=message,
+            spider=spider_name or 'unknown',
+            url=url or 'unknown',
+            status_code=status_code,
+            details=details,
+            **kwargs
+        )
+        self.spider_name = spider_name
+
+class ShutdownError(BunkrrError):
+    """Error raised when application shutdown is requested."""
+    
+    def __init__(
+        self,
+        message: str = "Application shutdown requested",
+        reason: Optional[str] = None,
+        clean: bool = True,
+        **kwargs: Any
+    ):
+        """Initialize shutdown error.
+        
+        Args:
+            message: Error message
+            reason: Optional reason for shutdown
+            clean: Whether this is a clean shutdown
+            **kwargs: Additional error context
+        """
+        super().__init__(
+            message,
+            details=reason,
+            clean_shutdown=clean,
+            **kwargs
+        )
+        self.reason = reason
+        self.clean = clean
 
 class ParsingError(BunkrrError):
     """Data parsing error."""
@@ -204,6 +290,36 @@ class FileSystemError(BunkrrError):
         self.path = path
         self.operation = operation
 
+class CacheError(BunkrrError):
+    """Cache operation error."""
+    
+    def __init__(
+        self,
+        message: str,
+        key: str,
+        operation: str,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize cache error.
+        
+        Args:
+            message: Error message
+            key: Cache key that caused the error
+            operation: Cache operation that failed (get/set/delete)
+            details: Optional error details
+            **kwargs: Additional error context
+        """
+        super().__init__(
+            message,
+            details=details,
+            key=key,
+            operation=operation,
+            **kwargs
+        )
+        self.key = key
+        self.operation = operation
+
 # Error codes mapping
 ERROR_CODES = {
     ConfigError: 'CONFIG_ERROR',
@@ -213,5 +329,6 @@ ERROR_CODES = {
     FileSystemError: 'FILESYSTEM_ERROR',
     ScrapyError: 'SCRAPY_ERROR',
     HTTPError: 'HTTP_ERROR',
-    ParsingError: 'PARSING_ERROR'
+    ParsingError: 'PARSING_ERROR',
+    CacheError: 'CACHE_ERROR'
 } 

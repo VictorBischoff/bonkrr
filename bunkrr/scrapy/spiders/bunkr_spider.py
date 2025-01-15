@@ -1,947 +1,604 @@
-"""Spider for extracting media from Bunkr.site."""
+"""Spider implementation for extracting media content from Bunkr.site."""
+from collections import Counter, defaultdict, deque
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import (
+    Any, Callable, Counter as CounterType, Deque, Dict, Generator,
+    Iterator, List, Optional, Set, TypeVar, Union
+)
+from urllib.parse import urljoin, urlparse
+import atexit
 import json
+import os
+import random
+import re
 import signal
 import sys
-import os
-from pathlib import Path
-from typing import Generator, List, Optional, Dict, Any, Set, Union, Callable, TypeVar, Iterator, Counter
-from urllib.parse import urljoin, urlparse
-import random
-import atexit
-import re
 import time
-import uuid
-from datetime import datetime
 import traceback
-from collections import Counter
-
-from scrapy import Spider, Request
-from scrapy.http import Response
-from twisted.internet import reactor
-from scrapy.exceptions import CloseSpider, DontCloseSpider
-from twisted.internet.error import ReactorNotRunning
-from scrapy.utils.project import get_project_settings
-
-from ...core.config import DownloadConfig
-from ...core.logger import setup_logger
-from ...ui.progress import ProgressTracker
-from ...downloader.rate_limiter import RateLimiter
-from ...core.exceptions import ScrapyError, BunkrrError, SpiderError
-from ...core.error_handler import ErrorHandler
+import uuid
 
 from bs4 import BeautifulSoup, SoupStrainer
+from scrapy import Spider, Request
+from scrapy.exceptions import CloseSpider, DontCloseSpider, IgnoreRequest
+from scrapy.http import Response
+from scrapy.utils.project import get_project_settings
+from twisted.internet import reactor
+from twisted.internet.error import ReactorNotRunning
+
+from ...core.config import DownloadConfig
+from ...core.error_handler import ErrorHandler, ErrorStats, ErrorContext
+from ...core.exceptions import (
+    BunkrrError, ParsingError, RateLimitError, ScrapyError, SpiderError,
+    HTTPError
+)
+from ...core.logger import setup_logger
+from ...downloader.rate_limiter import RateLimiter
+from ...ui.progress import ProgressTracker
+from ...utils.backoff import ExponentialBackoff
 
 logger = setup_logger('bunkrr.scrapy.spiders')
 
-# Type variables for callbacks
+# Type aliases
 T = TypeVar('T')
-CallbackType = Callable[[Response], Union[Generator[Request, None, None], Optional[Dict[str, Any]], None]]
+ResponseCallback = Callable[
+    [Response],
+    Union[Generator[Request, None, None], Optional[Dict[str, Any]], None]
+]
 
-# Compile regex patterns once
-URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
-ALBUM_ID_PATTERN = re.compile(r'/a/([a-zA-Z0-9]+)')
-MEDIA_ID_PATTERN = re.compile(r'/v/([a-zA-Z0-9]+)')
-
-# Create strainers once
-ALBUM_STRAINER = SoupStrainer(['meta', 'h1', 'div'], attrs={
-    'property': 'og:title',
-    'class_': ['truncate', 'theItem']
-})
-
-MEDIA_STRAINER = SoupStrainer(['img', 'p', 'span'], attrs={
-    'class_': ['grid-images_box-img', 'theSize', 'theDate']
-})
-
-class ResultPool:
-    """Pool for reusing result objects."""
+class _ResultPool:
+    """Internal pool for reusing result dictionaries to reduce memory allocations."""
     
-    def __init__(self, max_size: int = 1000):
-        """Initialize result pool."""
-        self._items: List[Dict] = []
+    def __init__(self, max_size: int = 1000) -> None:
+        """Initialize the result pool.
+        
+        Args:
+            max_size: Maximum number of items to keep in the pool
+        """
+        self._items: List[Dict[str, Any]] = []
         self._max_size = max_size
     
-    def get(self) -> Dict:
-        """Get an item from the pool."""
-        if self._items:
-            return self._items.pop()
-        return {}
+    def get(self) -> Dict[str, Any]:
+        """Get a result dictionary from the pool or create a new one."""
+        return self._items.pop() if self._items else {}
     
-    def put(self, item: Dict) -> None:
-        """Return an item to the pool."""
+    def put(self, item: Dict[str, Any]) -> None:
+        """Return a result dictionary to the pool if not full."""
         if len(self._items) < self._max_size:
             item.clear()
             self._items.append(item)
 
 class BunkrSpider(Spider):
-    """Spider for extracting media from Bunkr.site."""
+    """Spider for extracting media content from Bunkr.site."""
     
     name = 'bunkr'
+    
+    # Supported domains for media extraction
     allowed_domains = [
+        # Main domains
         'bunkr.site', 'bunkr.ru', 'bunkr.ph', 'bunkr.is', 'bunkr.to', 'bunkr.fi',
+        # CDN domains
         'i-kebab.bunkr.ru', 'i-pizza.bunkr.ru', 'i-burger.bunkr.ru',
         'kebab.bunkr.ru', 'pizza.bunkr.ru', 'burger.bunkr.ru',
         'c.bunkr-cache.se', 'get.bunkrr.su'
     ]
     
-    # Modern browser user agents
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15'
-    ]
-    
+    # Spider configuration
     custom_settings = {
-        # Concurrency settings
         'CONCURRENT_REQUESTS': 8,
         'CONCURRENT_REQUESTS_PER_DOMAIN': 4,
         'DOWNLOAD_TIMEOUT': 30,
-        
-        # Retry settings
         'RETRY_ENABLED': True,
         'RETRY_TIMES': 3,
         'RETRY_HTTP_CODES': [500, 502, 503, 504, 408, 429],
-        
-        # Cache settings
         'HTTPCACHE_ENABLED': False,
-        
-        # Middleware settings
         'DOWNLOADER_MIDDLEWARES': {
             'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
             'scrapy.downloadermiddlewares.retry.RetryMiddleware': 500,
             'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
             'scrapy.downloadermiddlewares.stats.DownloaderStats': 850,
             'scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware': None,
-            'bunkrr.scrapy.middlewares.CustomRateLimiterMiddleware': 450,
+            'bunkrr.scrapy.middlewares.RateLimitMiddleware': 450,
         },
-        
-        # Request settings
         'COOKIES_ENABLED': False,
         'DOWNLOAD_DELAY': 1,
-        
-        # Log settings
         'LOG_LEVEL': 'DEBUG',
-        
-        # Reactor settings
         'TWISTED_REACTOR': 'twisted.internet.selectreactor.SelectReactor',
-        
-        # Stats settings
         'STATS_CLASS': 'scrapy.statscollectors.MemoryStatsCollector'
     }
     
-    def __init__(
-        self,
-        config: DownloadConfig,
-        start_urls: List[str],
-        parent_folder: Path,
-        progress_tracker: Optional[ProgressTracker] = None,
-        **kwargs
-    ):
-        """Initialize spider with configuration."""
-        super().__init__(**kwargs)
-        self.config = config
-        self.start_urls = start_urls
-        self.parent_folder = parent_folder
-        self.progress_tracker = progress_tracker
+    # Private constants
+    _URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
+    _ALBUM_ID_PATTERN = re.compile(r'/a/([a-zA-Z0-9]+)')
+    _MEDIA_ID_PATTERN = re.compile(r'/v/([a-zA-Z0-9]+)')
+    
+    _ALBUM_STRAINER = SoupStrainer(['meta', 'h1', 'div'], attrs={
+        'property': 'og:title',
+        'class_': ['truncate', 'theItem']
+    })
+    
+    _MEDIA_STRAINER = SoupStrainer(['img', 'p', 'span'], attrs={
+        'class_': ['grid-images_box-img', 'theSize', 'theDate']
+    })
+    
+    _USER_AGENTS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15'
+    ]
+    
+    def __init__(self, *args, **kwargs):
+        """Initialize spider with error tracking and retry logic."""
+        super().__init__(*args, **kwargs)
         
-        # Initialize counters and state
-        self.media_count = 0
-        self.failed_count = 0
-        self.processed_urls: Set[str] = set()
-        self.running = True
-        self._shutdown_requested = False
-        self._cleanup_registered = False
+        # Error tracking
+        self._error_stats = ErrorStats(window_size=3600)  # 1 hour window
+        self._error_context = ErrorContext()
         
-        # Initialize request tracking
-        self._request_times: Dict[str, float] = {}
-        self._request_sizes: Dict[str, int] = {}
-        
-        # Verify download directory
-        try:
-            self.parent_folder.mkdir(parents=True, exist_ok=True)
-            if not self.parent_folder.is_dir():
-                raise CloseSpider(f"Download path is not a directory: {self.parent_folder}")
-            if not os.access(self.parent_folder, os.W_OK):
-                raise CloseSpider(f"No write permission for download path: {self.parent_folder}")
-        except Exception as e:
-            raise CloseSpider(f"Failed to setup download directory: {str(e)}")
-        
-        # Initialize rate limiter
-        self.rate_limiter = RateLimiter(
-            requests_per_window=self.config.rate_limit,
-            window_seconds=self.config.rate_window
+        # Retry handling
+        self._backoff = ExponentialBackoff(
+            initial=1.0,
+            maximum=60.0,
+            factor=2.0,
+            jitter=True
         )
         
-        # Set up signal handlers and cleanup
-        self._setup_handlers()
+        # Circuit breaker
+        self._error_counts: Dict[str, int] = defaultdict(int)
+        self._error_threshold = 5
+        self._error_window = timedelta(minutes=5)
+        self._last_errors: Dict[str, Deque[datetime]] = defaultdict(lambda: deque(maxlen=10))
         
-        # Initialize error tracking
-        self._error_counts = Counter()
-        self._error_timestamps: List[float] = []
-        self._error_window = 300  # 5 minutes
-        self._max_error_rate = 0.3  # 30% error rate threshold
+        # Request tracking
+        self._request_times: Dict[str, float] = {}
+        self._request_contexts: Dict[str, Dict[str, Any]] = {}
         
-        # Track parsing errors separately
-        self._parsing_errors = {
-            'album': Counter(),
-            'media': Counter(),
-            'selector': Counter(),
-            'network': Counter()
+        # Result pool
+        self._result_pool = _ResultPool()
+        
+        logger.debug("BunkrSpider initialized with error tracking and retry logic")
+    
+    def _should_retry(self, url: str, error: Exception) -> bool:
+        """Determine if request should be retried based on error history.
+        
+        Args:
+            url: Request URL
+            error: Exception that occurred
+            
+        Returns:
+            bool: Whether to retry the request
+        """
+        error_type = error.__class__.__name__
+        now = datetime.now()
+        
+        # Update error tracking
+        self._last_errors[url].append(now)
+        self._error_counts[url] += 1
+        
+        # Check circuit breaker
+        recent_errors = sum(
+            1 for t in self._last_errors[url]
+            if now - t <= self._error_window
+        )
+        
+        if recent_errors >= self._error_threshold:
+            logger.warning(
+                "Circuit breaker triggered for %s: %d errors in %s",
+                url, recent_errors, self._error_window
+            )
+            return False
+        
+        # Check error type
+        if isinstance(error, (RateLimitError, ParsingError)):
+            return True
+            
+        if isinstance(error, HTTPError):
+            return error.status_code in self.custom_settings['RETRY_HTTP_CODES']
+        
+        return False
+    
+    def _track_request(self, request: Request) -> None:
+        """Track request timing and context.
+        
+        Args:
+            request: Scrapy Request object
+        """
+        self._request_times[request.url] = time.time()
+        self._request_contexts[request.url] = {
+            'method': request.method,
+            'headers': dict(request.headers),
+            'meta': dict(request.meta)
+        }
+    
+    def _handle_error(
+        self,
+        error: Exception,
+        url: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Handle request error with enhanced context and tracking.
+        
+        Args:
+            error: Exception that occurred
+            url: Request URL
+            context: Optional additional context
+        """
+        # Calculate duration if request was tracked
+        duration = None
+        if url in self._request_times:
+            duration = time.time() - self._request_times[url]
+            del self._request_times[url]
+        
+        # Build error context
+        error_context = {
+            'url': url,
+            'spider': self.name,
+            'duration': duration,
+            'timestamp': datetime.now().isoformat()
         }
         
-        logger.info(
-            "Initialized BunkrSpider with parent_folder: %s, start_urls: %s",
-            parent_folder,
-            start_urls
+        # Add request context if available
+        if url in self._request_contexts:
+            error_context.update(self._request_contexts[url])
+            del self._request_contexts[url]
+        
+        # Add custom context
+        if context:
+            error_context.update(context)
+        
+        # Track error
+        self._error_stats.add_error(
+            error_type=error.__class__.__name__,
+            duration=duration,
+            context=error_context
         )
         
-        self._visited_urls: Set[str] = set()
-        self._result_pool = ResultPool()
-    
-    def _setup_handlers(self):
-        """Set up signal handlers and cleanup."""
-        if not self._cleanup_registered:
-            # Register signal handlers
-            signal.signal(signal.SIGINT, self._handle_sigint)
-            signal.signal(signal.SIGTERM, self._handle_sigint)
-            
-            # Register cleanup handler
-            atexit.register(self._cleanup)
-            
-            self._cleanup_registered = True
-    
-    def _shutdown(self, reason: str = 'shutdown', force: bool = False) -> None:
-        """Handle spider shutdown."""
-        if not self.running and not force:
-            return
-            
-        self.running = False
-        logger.info(
-            "Spider shutting down (%s). Stats - Processed: %d, Failed: %d",
-            reason,
-            self.media_count,
-            self.failed_count
+        # Log error with context
+        logger.error(
+            "Request error for %s: %s",
+            url,
+            str(error),
+            extra={'error_context': error_context},
+            exc_info=True
         )
-        
+    
+    @ErrorHandler.wrap
+    def start_requests(self) -> Generator[Request, None, None]:
+        """Start requests with error handling."""
         try:
-            # Stop the reactor if it's running
-            if reactor.running:
-                try:
-                    reactor.callFromThread(reactor.stop)
-                except ReactorNotRunning:
-                    pass
-                except Exception as e:
-                    logger.error("Error stopping reactor: %s", str(e))
-            
-            # Close progress tracker if exists
-            if self.progress_tracker:
-                self.progress_tracker.close()
-            
-            # Clean up rate limiter
-            if hasattr(self, 'rate_limiter'):
-                self.rate_limiter.close()
-            
+            for url in self.start_urls:
+                yield self._create_request(url)
         except Exception as e:
-            logger.error("Error during shutdown: %s", str(e))
-            if force:
-                sys.exit(1)
-
-    def _handle_sigint(self, signum, frame):
-        """Handle SIGINT (Ctrl+C) gracefully."""
-        if self._shutdown_requested:
-            logger.info("Forced shutdown requested.")
-            self._shutdown(reason='forced_shutdown', force=True)
-            return
-            
-        self._shutdown_requested = True
-        self._shutdown(reason='interrupt')
-    
-    def _cleanup(self):
-        """Clean up resources."""
-        self._shutdown(reason='cleanup', force=True)
-    
-    def closed(self, reason):
-        """Called when the spider is closed."""
-        self._shutdown(reason=reason)
-        
-        # Don't exit here, let the cleanup handler handle it
-        if reason == 'finished':
-            raise DontCloseSpider("Spider finished but cleanup pending")
+            self._handle_error(e, 'start_urls')
+            raise
     
     def _create_request(
         self,
         url: str,
-        callback: CallbackType,
-        priority: int = 0,
-        meta: Optional[Dict[str, Any]] = None
+        callback: Optional[ResponseCallback] = None,
+        **kwargs: Any
     ) -> Request:
-        """Create a request with proper headers and settings."""
-        headers = self.get_headers()
-        if meta is None:
-            meta = {}
+        """Create request with error tracking.
         
-        # Add correlation ID and timing info
-        request_id = str(uuid.uuid4())
-        meta.update({
-            'request_id': request_id,
-            'start_time': time.time(),
-            'request_url': url,
-            'spider_name': self.name
-        })
-        
-        logger.debug(
-            "Creating request [%s] - URL: %s, Headers: %s",
-            request_id,
-            url,
-            json.dumps(headers)
-        )
-        
-        return Request(
+        Args:
+            url: Target URL
+            callback: Optional callback function
+            **kwargs: Additional request parameters
+            
+        Returns:
+            Request: Configured request object
+        """
+        request = Request(
             url=url,
-            callback=callback,
-            priority=priority,
-            headers=headers,
-            meta=meta,
-            dont_filter=True,
-            errback=self.handle_error
+            callback=callback or self.parse,
+            headers={'User-Agent': random.choice(self._USER_AGENTS)},
+            dont_filter=kwargs.pop('dont_filter', False),
+            **kwargs
         )
-    
-    def get_headers(self):
-        """Get request headers with random user agent."""
-        return {
-            'User-Agent': random.choice(self.user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Pragma': 'no-cache',
-            'Cache-Control': 'no-cache'
-        }
-    
-    def _get_media_selectors(self):
-        """Get media selectors with fallbacks."""
-        return {
-            'album_title': [
-                'h1.text-xl::text',
-                'h1.truncate::text',
-                'meta[property="og:title"]::attr(content)',
-                'title::text'
-            ],
-            'media_links': [
-                'div.theItem a[href^="/f/"]::attr(href)',
-                'a.after\\:absolute[href^="/f/"]::attr(href)',
-                'a[href^="/f/"]::attr(href)'
-            ],
-            'download_link': [
-                'a[href^="https://get.bunkrr.su/file/"]::attr(href)',
-                'a[href*="get.bunkrr.su"]::attr(href)',
-                'a[href*="download"]::attr(href)'
-            ],
-            'image_src': [
-                'figure.relative img.max-h-full::attr(src)',
-                'img.max-h-full::attr(src)',
-                'img.max-w-full::attr(src)',
-                'meta[property="og:image"]::attr(content)'
-            ],
-            'video_src': [
-                'video#player source::attr(src)',
-                'video source::attr(src)',
-                'meta[property="og:video"]::attr(content)'
-            ],
-            'file_size': [
-                'p.text-xs::text',
-                'span.text-xs::text',
-                'div.text-xs::text'
-            ]
-        }
-    
-    def _try_selectors(self, response: Response, selector_type: str, get_all: bool = False) -> Optional[Union[str, List[str]]]:
-        """Try multiple selectors and return first match or all matches."""
-        selectors = self._get_media_selectors().get(selector_type, [])
-        for selector in selectors:
-            results = response.css(selector).getall() if get_all else response.css(selector).get()
-            if results:
-                if get_all:
-                    return [r.strip() for r in results if r and r.strip()]
-                return results.strip()
-        return [] if get_all else None
-    
-    def _try_selectors_all(self, response: Response, selector_type: str) -> List[str]:
-        """Try multiple selectors and return all matches."""
-        return self._try_selectors(response, selector_type, get_all=True) or []
-    
-    def parse_album(self, response: Response) -> Generator[Request, None, None]:
-        """Parse album page to extract media links."""
-        if not self.running:
-            return
-            
-        album_url = response.meta.get('album_url', response.url)
-        logger.debug("Parsing album page: %s (Status: %d)", album_url, response.status)
         
+        self._track_request(request)
+        return request
+    
+    @ErrorHandler.wrap
+    def parse(self, response: Response) -> Generator[Request, None, None]:
+        """Parse response with error handling.
+        
+        Args:
+            response: Scrapy Response object
+            
+        Yields:
+            Request objects for further processing
+        """
         try:
-            # Extract album title
-            album_title = self._try_selectors(response, 'album_title')
-            if not album_title:
-                logger.warning("No album title found for URL: %s", album_url)
-                album_title = album_url.split('/')[-1]
+            # Extract URLs from response
+            urls = self._extract_urls(response)
             
-            album_title = album_title.strip()
-            logger.debug("Found album title: %s", album_title)
-            
-            # Extract media links
-            media_links = self._try_selectors_all(response, 'media_links')
-            
-            if not media_links:
-                logger.warning("No media links found in album: %s", album_url)
-                self._handle_media_failure(response)
-                return
-            
-            logger.info(
-                "Found %d media links in album: %s",
-                len(media_links),
-                album_title
-            )
-            
-            # Process each media link
-            for link in media_links:
-                if not self.running or not link:
-                    continue
+            # Process each URL
+            for url in urls:
+                try:
+                    if self._ALBUM_ID_PATTERN.search(url):
+                        yield self._create_request(url, callback=self.parse_album)
+                    elif self._MEDIA_ID_PATTERN.search(url):
+                        yield self._create_request(url, callback=self.parse_media)
+                except Exception as e:
+                    self._handle_error(e, url, {'source': 'parse_url'})
                     
-                media_url = urljoin(response.url, link)
-                logger.debug("Processing media URL: %s", media_url)
-                
-                yield self._create_request(
-                    url=media_url,
-                    callback=self.parse_media,
-                    meta={
-                        'album_title': album_title,
-                        'media_url': media_url
-                    }
-                )
-                
         except Exception as e:
-            logger.error(
-                "Error parsing album page %s: %s",
-                response.url,
-                str(e),
-                exc_info=True
-            )
-            self._handle_media_failure(response)
+            self._handle_error(e, response.url, {'source': 'parse'})
+            raise
     
-    def _extract_media_info(self, response: Response) -> Optional[Dict[str, Any]]:
-        """Extract media information from response."""
-        media_type = None
-        media_src = None
+    @ErrorHandler.wrap
+    def parse_album(self, response: Response) -> Generator[Request, None, None]:
+        """Parse album page with error handling.
         
-        # Check for image content
-        image_src = self._try_selectors(response, 'image_src')
-        if image_src:
-            media_type = 'image'
-            media_src = image_src
-            logger.debug("Found image source: %s", image_src)
-        
-        # Check for video content
-        if not media_src:
-            video_src = self._try_selectors(response, 'video_src')
-            if video_src:
-                media_type = 'video'
-                media_src = video_src
-                logger.debug("Found video source: %s", video_src)
-        
-        # Try meta tags as fallback
-        if not media_src:
-            media_src = response.css('meta[property="og:image"]::attr(content), meta[property="og:url"]::attr(content)').get()
-            if media_src:
-                media_type = 'image' if any(ext in media_src for ext in ['.gif', '.jpg', '.jpeg', '.png', '.webp']) else 'video'
-                logger.debug("Found media source from meta tags: %s", media_src)
-        
-        return {'type': media_type, 'src': media_src} if media_src else None
-
-    def _create_media_item(
-        self,
-        response: Response,
-        download_link: str,
-        media_info: Dict[str, Any],
-        album_title: str
-    ) -> Dict[str, Any]:
-        """Create media item dictionary."""
-        thumbnail = response.css('meta[property="og:image"]::attr(content)').get()
-        file_size = self._try_selectors(response, 'file_size')
-        
-        return {
-            'file_urls': [download_link],
-            'media_type': media_info['type'],
-            'media_src': media_info['src'],
-            'thumbnail_url': thumbnail,
-            'file_size': file_size.strip() if file_size else None,
-            'album_title': album_title,
-            'source_url': response.url,
-            'filename': media_info['src'].split('/')[-1],
-            'headers': self.get_headers()
-        }
-
-    def parse_media(self, response: Response) -> Optional[Dict[str, Any]]:
-        """Parse media page to extract download URL."""
-        if not self.running:
-            return None
+        Args:
+            response: Scrapy Response object
             
-        album_title = response.meta.get('album_title', 'unknown')
-        media_url = response.meta.get('media_url', response.url)
-        logger.debug("Parsing media page: %s (Status: %d)", media_url, response.status)
-        
+        Yields:
+            Request objects for media items
+        """
         try:
-            # Extract direct download link
-            download_link = self._try_selectors(response, 'download_link')
-            if not download_link:
-                logger.warning("No download link found on page: %s", response.url)
-                self._handle_media_failure(response)
-                return None
+            # Parse album metadata
+            soup = BeautifulSoup(response.text, 'lxml', parse_only=self._ALBUM_STRAINER)
             
-            logger.debug("Found download link: %s", download_link)
+            # Extract media URLs
+            media_urls = self._extract_media_urls(soup)
+            
+            # Process each media URL
+            for url in media_urls:
+                try:
+                    yield self._create_request(url, callback=self.parse_media)
+                except Exception as e:
+                    self._handle_error(e, url, {
+                        'source': 'parse_album',
+                        'album_url': response.url
+                    })
+                    
+        except Exception as e:
+            self._handle_error(e, response.url, {'source': 'parse_album'})
+            raise
+    
+    @ErrorHandler.wrap
+    def parse_media(self, response: Response) -> Optional[Dict[str, Any]]:
+        """Parse media page with error handling.
+        
+        Args:
+            response: Scrapy Response object
+            
+        Returns:
+            Optional[Dict[str, Any]]: Media metadata if successful
+        """
+        try:
+            # Parse media metadata
+            soup = BeautifulSoup(response.text, 'lxml', parse_only=self._MEDIA_STRAINER)
             
             # Extract media information
-            media_info = self._extract_media_info(response)
+            media_info = self._extract_media_info(soup)
+            
             if not media_info:
-                logger.warning("No media source found on page: %s", response.url)
-                self._handle_media_failure(response)
-                return None
+                raise ParsingError(
+                    "Failed to extract media information",
+                    data_type='media_info',
+                    source=response.url
+                )
             
-            # Create and return media item
-            item = self._create_media_item(response, download_link, media_info, album_title)
-            self._handle_media_success()
-            return item
+            return media_info
             
         except Exception as e:
-            logger.error(
-                "Error parsing media page %s: %s",
-                response.url,
-                str(e),
-                exc_info=True
-            )
-            self._handle_media_failure(response)
-            return None
-
-    def _handle_media_success(self):
-        """Handle successful media extraction."""
-        self.media_count += 1
-        logger.info(
-            "Media extraction successful - Total successful: %d, Total failed: %d",
-            self.media_count,
-            self.failed_count
-        )
-        if self.progress_tracker:
-            self.progress_tracker.update(completed=1)
-
-    def _handle_media_failure(self, response: Response):
-        """Handle media extraction failure."""
-        request_id = response.meta.get('request_id', 'unknown')
-        error_msg = f"Failed to extract media from {response.url}"
-        
-        # Track parsing error
-        self._track_error('media', 'extraction_failed', error_msg)
-        
-        logger.error(
-            "Media extraction failed [%s] - URL: %s\n"
-            "Status: %d\nHeaders: %s\nBody Preview: %s",
-            request_id,
-            response.url,
-            response.status,
-            json.dumps(dict(response.headers)),
-            response.text[:1000]
-        )
-        
-        if self.progress_tracker:
-            self.progress_tracker.update(failed=1)
-        self.failed_count += 1
+            self._handle_error(e, response.url, {'source': 'parse_media'})
+            raise
     
-    def handle_error(self, failure):
-        """Handle request failures."""
-        request = failure.request
-        request_id = request.meta.get('request_id', 'unknown')
-        start_time = request.meta.get('start_time', time.time())
-        duration = time.time() - start_time
+    def _extract_urls(self, response: Response) -> List[str]:
+        """Extract URLs from response with error handling.
         
-        # Extract error details
-        error_type = type(failure.value).__name__
-        error_msg = str(failure.value)
-        tb_str = ''.join(traceback.format_tb(failure.getTracebackObject())) if failure.getTracebackObject() else ''
-        
-        # Categorize error
-        if 'timeout' in error_msg.lower():
-            error_subtype = 'timeout'
-        elif 'connection' in error_msg.lower():
-            error_subtype = 'connection'
-        elif 'dns' in error_msg.lower():
-            error_subtype = 'dns'
-        else:
-            error_subtype = 'unknown'
-        
-        # Create structured error
-        error = ScrapyError(
-            message=error_msg,
-            spider_name=self.name,
-            url=request.url,
-            details={
-                'error_type': error_type,
-                'error_subtype': error_subtype,
-                'traceback': tb_str,
-                'request_id': request_id,
-                'duration': duration,
-                'headers': request.headers
-            }
-        )
-        
-        # Track and log error
-        self._track_error('network', error_subtype, error_msg)
-        
-        logger.error(
-            "Request failed [%s] - Type: %s, Subtype: %s\n"
-            "URL: %s\nDuration: %.2fs\nError: %s\n"
-            "Headers: %s\nTraceback:\n%s",
-            request_id,
-            error_type,
-            error_subtype,
-            request.url,
-            duration,
-            error_msg,
-            json.dumps(dict(request.headers)),
-            tb_str
-        )
-        
-        ErrorHandler.handle_error(error, context="spider_request", reraise=False)
-        
-        self.failed_count += 1
-        if self.progress_tracker:
-            self.progress_tracker.update(failed=1)
-
-    def normalize_url(self, url: str) -> str:
-        """Normalize URL for comparison."""
-        parsed = urlparse(url)
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-
-    def start_requests(self) -> Generator[Request, None, None]:
-        """Generate initial requests."""
-        for url in self.config.start_urls:
-            normalized = self.normalize_url(url)
-            if normalized not in self._visited_urls:
-                self._visited_urls.add(normalized)
-                yield Request(url=url, callback=self.parse)
-    
-    def parse(self, response: Response) -> Optional[Dict[str, Any]]:
-        """Parse response and delegate to appropriate parser."""
-        if not self.running:
-            return None
-        
-        request_id = response.meta.get('request_id', 'unknown')
-        start_time = response.meta.get('start_time', time.time())
-        duration = time.time() - start_time
-        
-        logger.info(
-            "Received response [%s] - URL: %s, Status: %d, Size: %d bytes, Duration: %.2fs",
-            request_id,
-            response.url,
-            response.status,
-            len(response.body),
-            duration
-        )
-        
+        Args:
+            response: Scrapy Response object
+            
+        Returns:
+            List[str]: List of extracted URLs
+        """
         try:
-            # Extract album ID from URL
-            album_match = ALBUM_ID_PATTERN.search(response.url)
-            if album_match:
-                logger.debug(
-                    "Processing album [%s] - Album ID: %s",
-                    request_id,
-                    album_match.group(1)
-                )
-                return self._parse_album(response)
-            
-            # Extract media ID from URL
-            media_match = MEDIA_ID_PATTERN.search(response.url)
-            if media_match:
-                logger.debug(
-                    "Processing media [%s] - Media ID: %s",
-                    request_id,
-                    media_match.group(1)
-                )
-                return self._parse_media(response)
-            
-            logger.warning(
-                "URL doesn't match any known patterns [%s] - URL: %s",
-                request_id,
-                response.url
-            )
-            return None
+            urls = []
+            for match in self._URL_PATTERN.finditer(response.text):
+                url = match.group()
+                if not url.startswith('http'):
+                    url = urljoin(response.url, url)
+                urls.append(url)
+            return urls
             
         except Exception as e:
-            logger.error(
-                "Error parsing response [%s] - URL: %s, Error: %s",
-                request_id,
-                response.url,
-                str(e),
-                exc_info=True
-            )
-            self._handle_media_failure(response)
-            return None
+            self._handle_error(e, response.url, {'source': 'extract_urls'})
+            return []
     
-    def _parse_album(self, response: Response) -> Dict[str, Any]:
-        """Parse album page."""
-        request_id = response.meta.get('request_id', 'unknown')
-        start_time = time.time()
+    def _extract_media_urls(self, soup: BeautifulSoup) -> List[str]:
+        """Extract media URLs from soup with error handling.
         
-        logger.info(
-            "Starting album parsing [%s] - URL: %s",
-            request_id,
-            response.url
-        )
-        
-        soup = BeautifulSoup(response.text, 'lxml', parse_only=ALBUM_STRAINER)
-        result = self._result_pool.get()
-        
+        Args:
+            soup: BeautifulSoup object
+            
+        Returns:
+            List[str]: List of media URLs
+        """
         try:
-            # Extract meta title
-            meta_title = soup.find('meta', property='og:title')
-            if meta_title and meta_title.get('content'):
-                result['title'] = meta_title['content']
-                logger.debug(
-                    "Found album meta title [%s] - Title: %s",
-                    request_id,
-                    result['title']
-                )
-            
-            # Extract h1 title
-            h1_title = soup.find('h1', class_='truncate')
-            if h1_title:
-                result['header'] = h1_title.get_text(strip=True)
-                logger.debug(
-                    "Found album header [%s] - Header: %s",
-                    request_id,
-                    result['header']
-                )
-            
-            # Extract media items
-            media_items = []
-            item_count = 0
-            total_size = 0
-            
-            for item in soup.find_all('div', class_='theItem'):
-                item_count += 1
-                media_item = self._result_pool.get()
-                item_start = time.time()
-                
-                logger.debug(
-                    "Processing media item %d [%s]",
-                    item_count,
-                    request_id
-                )
-                
-                # Extract file info
-                filename = item.find('p', style='display:none;')
-                if filename:
-                    media_item['filename'] = filename.get_text(strip=True)
-                
-                size = item.find('p', class_='theSize')
-                if size:
-                    media_item['size'] = size.get_text(strip=True)
-                    try:
-                        # Convert size string to bytes for tracking
-                        size_str = size.get_text(strip=True).lower()
-                        if 'mb' in size_str:
-                            size_bytes = float(size_str.replace('mb', '')) * 1024 * 1024
-                        elif 'kb' in size_str:
-                            size_bytes = float(size_str.replace('kb', '')) * 1024
-                        else:
-                            size_bytes = float(size_str)
-                        total_size += size_bytes
-                    except (ValueError, AttributeError):
-                        logger.warning(
-                            "Could not parse file size [%s] - Size string: %s",
-                            request_id,
-                            size_str
-                        )
-                
-                date = item.find('span', class_='theDate')
-                if date:
-                    media_item['date'] = date.get_text(strip=True)
-                
-                thumbnail = item.find('img', class_='grid-images_box-img')
-                if thumbnail and thumbnail.get('src'):
-                    media_item['thumbnail'] = thumbnail['src']
-                
-                item_duration = time.time() - item_start
-                logger.debug(
-                    "Media item %d processed [%s] - Duration: %.2fs, Filename: %s, Size: %s",
-                    item_count,
-                    request_id,
-                    item_duration,
-                    media_item.get('filename', 'unknown'),
-                    media_item.get('size', 'unknown')
-                )
-                
-                media_items.append(media_item)
-            
-            result['media_items'] = media_items
-            
-            duration = time.time() - start_time
-            logger.info(
-                "Album parsing completed [%s] - Items: %d, Total Size: %.2f MB, Duration: %.2fs",
-                request_id,
-                item_count,
-                total_size / (1024 * 1024),
-                duration
-            )
-            
-            return result
+            urls = []
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if self._MEDIA_ID_PATTERN.search(href):
+                    urls.append(href)
+            return urls
             
         except Exception as e:
-            duration = time.time() - start_time
-            logger.error(
-                "Album parsing failed [%s] - Duration: %.2fs, Error: %s",
-                request_id,
-                duration,
-                str(e),
-                exc_info=True
-            )
-            self._result_pool.put(result)
-            raise SpiderError(f"Failed to parse album: {e}")
+            self._handle_error(e, 'unknown', {'source': 'extract_media_urls'})
+            return []
     
-    def _parse_media(self, response: Response) -> Dict[str, Any]:
-        """Parse media page."""
-        request_id = response.meta.get('request_id', 'unknown')
-        start_time = time.time()
+    def _extract_media_info(self, soup: BeautifulSoup) -> Optional[Dict[str, Any]]:
+        """Extract media information from soup with error handling.
         
-        logger.info(
-            "Starting media parsing [%s] - URL: %s",
-            request_id,
-            response.url
-        )
-        
-        soup = BeautifulSoup(response.text, 'lxml', parse_only=MEDIA_STRAINER)
-        result = self._result_pool.get()
-        
+        Args:
+            soup: BeautifulSoup object
+            
+        Returns:
+            Optional[Dict[str, Any]]: Media information if successful
+        """
         try:
-            # Extract media info
+            result = self._result_pool.get()
+            
+            # Extract media details
             img = soup.find('img', class_='grid-images_box-img')
             if img and img.get('src'):
                 result['url'] = img['src']
-                logger.debug(
-                    "Found media URL [%s] - URL: %s",
-                    request_id,
-                    result['url']
-                )
+                result['type'] = 'image'
+                
+            size_elem = soup.find('p', class_='theSize')
+            if size_elem:
+                result['size'] = size_elem.text.strip()
+                
+            date_elem = soup.find('span', class_='theDate')
+            if date_elem:
+                result['date'] = date_elem.text.strip()
             
-            size = soup.find('p', class_='theSize')
-            if size:
-                result['size'] = size.get_text(strip=True)
-                logger.debug(
-                    "Found media size [%s] - Size: %s",
-                    request_id,
-                    result['size']
-                )
-            
-            date = soup.find('span', class_='theDate')
-            if date:
-                result['date'] = date.get_text(strip=True)
-                logger.debug(
-                    "Found media date [%s] - Date: %s",
-                    request_id,
-                    result['date']
-                )
-            
-            duration = time.time() - start_time
-            logger.info(
-                "Media parsing completed [%s] - Size: %s, Duration: %.2fs",
-                request_id,
-                result.get('size', 'unknown'),
-                duration
-            )
-            
-            return result
+            return result if result else None
             
         except Exception as e:
-            duration = time.time() - start_time
-            logger.error(
-                "Media parsing failed [%s] - Duration: %.2fs, Error: %s",
-                request_id,
-                duration,
-                str(e),
-                exc_info=True
+            self._handle_error(e, 'unknown', {'source': 'extract_media_info'})
+            return None
+        finally:
+            if result:
+                self._result_pool.put(result)
+    
+    def process_request(self, request: Request, spider: Spider) -> Optional[Request]:
+        """Process request with error handling.
+        
+        Args:
+            request: Request being processed
+            spider: Spider instance
+            
+        Returns:
+            Optional[Request]: Modified request or None
+        """
+        try:
+            # Track request
+            self._track_request(request)
+            
+            # Add error context
+            request.meta['error_context'] = {
+                'spider': self.name,
+                'start_time': time.time(),
+                'request_id': str(uuid.uuid4())
+            }
+            
+            return request
+            
+        except Exception as e:
+            self._handle_error(e, request.url, {'source': 'process_request'})
+            return None
+    
+    def process_response(
+        self,
+        request: Request,
+        response: Response,
+        spider: Spider
+    ) -> Union[Response, Request]:
+        """Process response with error handling.
+        
+        Args:
+            request: Original request
+            response: Response being processed
+            spider: Spider instance
+            
+        Returns:
+            Union[Response, Request]: Processed response or retry request
+        """
+        try:
+            # Check response status
+            if response.status >= 400:
+                error = HTTPError(
+                    f"HTTP {response.status}",
+                    method=request.method,
+                    url=request.url,
+                    status_code=response.status
+                )
+                
+                if self._should_retry(request.url, error):
+                    # Calculate backoff delay
+                    delay = self._backoff.get_delay(request.url)
+                    request.meta['retry_delay'] = delay
+                    
+                    logger.info(
+                        "Retrying %s in %.2f seconds (attempt %d)",
+                        request.url,
+                        delay,
+                        self._error_counts[request.url]
+                    )
+                    
+                    return request
+                else:
+                    self._handle_error(error, request.url)
+            
+            return response
+            
+        except Exception as e:
+            self._handle_error(e, request.url, {'source': 'process_response'})
+            return response
+    
+    def process_exception(
+        self,
+        request: Request,
+        exception: Exception,
+        spider: Spider
+    ) -> Optional[Union[Response, Request]]:
+        """Process exception with error handling.
+        
+        Args:
+            request: Failed request
+            exception: Exception that occurred
+            spider: Spider instance
+            
+        Returns:
+            Optional[Union[Response, Request]]: Retry request or None
+        """
+        try:
+            if self._should_retry(request.url, exception):
+                # Calculate backoff delay
+                delay = self._backoff.get_delay(request.url)
+                request.meta['retry_delay'] = delay
+                
+                logger.info(
+                    "Retrying %s in %.2f seconds (attempt %d)",
+                    request.url,
+                    delay,
+                    self._error_counts[request.url]
+                )
+                
+                return request
+            else:
+                self._handle_error(exception, request.url)
+                return None
+                
+        except Exception as e:
+            self._handle_error(e, request.url, {'source': 'process_exception'})
+            return None
+    
+    def closed(self, reason: str) -> None:
+        """Handle spider closure with error cleanup.
+        
+        Args:
+            reason: Reason for closure
+        """
+        try:
+            # Log error statistics
+            logger.info(
+                "Spider closed (%s) - Error stats: %s",
+                reason,
+                json.dumps(self._error_stats.get_stats(), indent=2)
             )
-            self._result_pool.put(result)
-            raise SpiderError(f"Failed to parse media: {e}")
-
-    def _track_error(self, error_type: str, error_subtype: str, error_msg: str) -> None:
-        """Track error occurrence and check error rate."""
-        current_time = time.time()
-        
-        # Add error to counters
-        self._error_counts[error_type] += 1
-        if error_type in self._parsing_errors:
-            self._parsing_errors[error_type][error_subtype] += 1
-        
-        # Add timestamp and clean old ones
-        self._error_timestamps.append(current_time)
-        self._error_timestamps = [t for t in self._error_timestamps 
-                                if current_time - t <= self._error_window]
-        
-        # Calculate error rate
-        error_rate = len(self._error_timestamps) / (
-            self.media_count + self.failed_count
-        ) if (self.media_count + self.failed_count) > 0 else 0
-        
-        logger.error(
-            "Error occurred - Type: %s, Subtype: %s, Message: %s, "
-            "Count: %d, Rate: %.2f%%, Window: %d seconds",
-            error_type,
-            error_subtype,
-            error_msg,
-            self._error_counts[error_type],
-            error_rate * 100,
-            self._error_window
-        )
-        
-        # Log error frequency statistics periodically
-        if len(self._error_timestamps) % 10 == 0:  # Every 10 errors
-            self._log_error_stats()
-        
-        # Check if error rate exceeds threshold
-        if error_rate > self._max_error_rate:
-            logger.critical(
-                "Error rate %.2f%% exceeds threshold %.2f%% - "
-                "Consider implementing backoff or circuit breaking",
-                error_rate * 100,
-                self._max_error_rate * 100
-            )
-
-    def _log_error_stats(self) -> None:
-        """Log error statistics."""
-        logger.info("Error Statistics:")
-        
-        # Log general error counts
-        for error_type, count in self._error_counts.most_common():
-            logger.info("  %s: %d occurrences", error_type, count)
-        
-        # Log detailed parsing errors
-        for category, errors in self._parsing_errors.items():
-            if errors:
-                logger.info("  %s errors:", category.title())
-                for subtype, count in errors.most_common(5):  # Top 5 most common
-                    logger.info("    - %s: %d occurrences", subtype, count)
-
-    def _handle_selector_error(self, selector: str, context: str, request_id: str) -> None:
-        """Handle selector failures."""
-        error_msg = f"Selector '{selector}' failed in context '{context}'"
-        self._track_error('selector', context, error_msg)
-        
-        logger.warning(
-            "Selector failed [%s] - Selector: %s, Context: %s",
-            request_id,
-            selector,
-            context
-        )
+            
+            # Clear error tracking
+            self._error_counts.clear()
+            self._last_errors.clear()
+            self._request_times.clear()
+            self._request_contexts.clear()
+            
+        except Exception as e:
+            logger.error("Error during spider cleanup: %s", str(e), exc_info=True)

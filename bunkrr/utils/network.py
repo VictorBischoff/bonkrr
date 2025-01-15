@@ -80,6 +80,23 @@ class URLValidator:
         for url in urls:
             self.validate(url)
 
+async def normalize_url(url: str) -> str:
+    """Normalize URL by removing fragments and normalizing path.
+    
+    Args:
+        url: URL to normalize
+        
+    Returns:
+        Normalized URL string
+    """
+    parsed = URL(url)
+    # Remove fragments and normalize path
+    normalized = parsed.with_fragment(None).normalize()
+    # Ensure scheme is https
+    if not normalized.scheme:
+        normalized = normalized.with_scheme('https')
+    return str(normalized)
+
 @dataclass
 class HTTPConfig:
     """HTTP client configuration."""
@@ -139,9 +156,13 @@ class HTTPClient:
     @ErrorHandler.wrap_async
     async def close(self) -> None:
         """Close client and cleanup resources."""
-        if not self.session.closed:
-            await self.session.close()
-        await self.connector.close()
+        try:
+            if not self.session.closed:
+                await self.session.close()
+            await self.connector.close()
+        except Exception as e:
+            logger.error("Error closing HTTP client: %s", str(e))
+            raise
     
     @ErrorHandler.wrap_async
     async def get(
@@ -299,8 +320,14 @@ class HTTPClient:
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Exit async context."""
-        await self.close()
+        """Exit async context and ensure cleanup."""
+        try:
+            await self.close()
+        except Exception as e:
+            logger.error("Error in HTTP client cleanup: %s", str(e))
+            # Don't suppress the original exception if there was one
+            if exc_type is None:
+                raise
 
 # Create global URL validator instance
 url_validator = URLValidator()

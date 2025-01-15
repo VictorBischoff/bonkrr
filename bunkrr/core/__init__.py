@@ -1,10 +1,7 @@
 """Core functionality for the bunkrr package."""
 from .config import DownloadConfig
-from .error_handler import (
-    ErrorHandler,
-    handle_errors,
-    handle_async_errors
-)
+from .error_handler import ErrorHandler
+from .decorators import handle_errors, handle_async_errors
 from .exceptions import (
     BunkrrError,
     ConfigError,

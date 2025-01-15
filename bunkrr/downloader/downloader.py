@@ -215,6 +215,7 @@ class Downloader:
         download_size = 0
         success = False
         status_code = None
+        file_path = None
         
         # Normalize URL
         url = normalize_url(url)
@@ -250,7 +251,7 @@ class Downloader:
             await self._rate_limiter.acquire()
             
             # Download file
-            async with self._session.get(url) as response:
+            async with self._session.get(url, ssl=False) as response:
                 status_code = response.status
                 self._stats.status_counts[status_code] += 1
                 
@@ -290,13 +291,37 @@ class Downloader:
             self._stats.add_error('cancelled')
             return False
             
+        except client_exceptions.ClientError as e:
+            error_type = type(e).__name__
+            self._stats.add_error(error_type)
+            log_exception(
+                logger,
+                e,
+                f"HTTP client error downloading {url}",
+                error_type=error_type
+            )
+            return False
+            
+        except OSError as e:
+            error_type = type(e).__name__
+            self._stats.add_error(error_type)
+            log_exception(
+                logger,
+                e,
+                f"OS error downloading {url}",
+                error_type=error_type,
+                file_path=str(file_path) if file_path else None
+            )
+            return False
+            
         except Exception as e:
             error_type = type(e).__name__
             self._stats.add_error(error_type)
             log_exception(
                 logger,
                 e,
-                f"Error downloading {url} - Type: {error_type}"
+                f"Unexpected error downloading {url}",
+                error_type=error_type
             )
             return False
             

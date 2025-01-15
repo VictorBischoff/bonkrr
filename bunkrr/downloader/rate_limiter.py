@@ -92,85 +92,112 @@ class RateLimiter:
     
     async def acquire(self, tokens: float = 1.0) -> None:
         """Acquire tokens with optimized waiting strategy."""
-        if tokens > self.bucket_size:
+        if not (0 < tokens <= self.bucket_size):
             raise RateLimitError(
-                f"Requested tokens ({tokens}) exceed bucket size ({self.bucket_size})"
+                f"Invalid token request: {tokens} (must be between 0 and {self.bucket_size})"
             )
         
         start_time = time.monotonic()
         self._stats['total_requests'] += 1
         
-        async with self._lock:
-            now = time.monotonic()
-            cleaned_tokens = self._cleanup_tokens(now)
-            
-            # Check if we're within rate limit
-            if len(self._token_queue) >= self.bucket_size:
-                wait_time = self._token_queue[0] + self._window_size - now
-                if wait_time > 0:
-                    self._stats['rate_limit_hits'] += 1
-                    logger.warning(
-                        "Rate limit exceeded - Waiting: %.2fs, Queue size: %d/%d, "
-                        "Rate limit hits: %d",
-                        wait_time,
-                        len(self._token_queue),
-                        self.bucket_size,
-                        self._stats['rate_limit_hits']
-                    )
-                    await asyncio.sleep(wait_time)
-                    now = time.monotonic()
-            
-            # Add new token timestamp
-            self._token_queue.append(now)
-            
-            # Update token bucket
-            self._add_tokens()
-            
-            # Wait if not enough tokens
-            total_wait = 0.0
-            while self.current_tokens < tokens:
-                self._stats['token_shortages'] += 1
-                wait_time = (tokens - self.current_tokens) / self.rate
-                total_wait += wait_time
+        try:
+            async with self._lock:
+                now = time.monotonic()
+                cleaned_tokens = self._cleanup_tokens(now)
                 
-                logger.debug(
-                    "Token shortage - Waiting: %.2fs, Required: %.2f, Available: %.2f, "
-                    "Shortages: %d",
-                    wait_time,
-                    tokens,
-                    self.current_tokens,
-                    self._stats['token_shortages']
+                # Check if we're within rate limit
+                if len(self._token_queue) >= self.bucket_size:
+                    wait_time = self._token_queue[0] + self._window_size - now
+                    if wait_time > 0:
+                        self._stats['rate_limit_hits'] += 1
+                        logger.warning(
+                            "Rate limit exceeded - Waiting: %.2fs, Queue size: %d/%d, "
+                            "Rate limit hits: %d",
+                            wait_time,
+                            len(self._token_queue),
+                            self.bucket_size,
+                            self._stats['rate_limit_hits']
+                        )
+                        await asyncio.sleep(wait_time)
+                        now = time.monotonic()
+                
+                # Add new token timestamp
+                self._token_queue.append(now)
+                
+                # Update token bucket
+                self._add_tokens()
+                
+                # Wait if not enough tokens
+                total_wait = 0.0
+                max_wait_time = tokens / self.rate * 2  # Double the theoretical wait time as safety
+                wait_start = time.monotonic()
+                
+                while self.current_tokens < tokens:
+                    self._stats['token_shortages'] += 1
+                    wait_time = min(
+                        (tokens - self.current_tokens) / self.rate,
+                        1.0  # Cap individual waits to 1 second
+                    )
+                    total_wait += wait_time
+                    
+                    # Check for excessive waiting
+                    if total_wait > max_wait_time:
+                        raise RateLimitError(
+                            f"Maximum wait time exceeded: {total_wait:.2f}s > {max_wait_time:.2f}s"
+                        )
+                    
+                    logger.debug(
+                        "Token shortage - Waiting: %.2fs, Required: %.2f, Available: %.2f, "
+                        "Shortages: %d",
+                        wait_time,
+                        tokens,
+                        self.current_tokens,
+                        self._stats['token_shortages']
+                    )
+                    
+                    await asyncio.sleep(wait_time)
+                    self._add_tokens()
+                
+                self.current_tokens -= tokens
+                
+                # Update statistics
+                request_time = time.monotonic() - start_time
+                self._stats['total_wait_time'] += total_wait
+                self._stats['max_wait_time'] = max(
+                    self._stats['max_wait_time'],
+                    request_time
                 )
                 
-                await asyncio.sleep(wait_time)
-                self._add_tokens()
-            
-            self.current_tokens -= tokens
-            
-            # Update statistics
-            request_time = time.monotonic() - start_time
-            self._stats['total_wait_time'] += total_wait
-            self._stats['max_wait_time'] = max(
-                self._stats['max_wait_time'],
-                request_time
+                # Log detailed acquisition info
+                logger.info(
+                    "Token acquisition completed - Stats: %s",
+                    json.dumps({
+                        'tokens_requested': tokens,
+                        'tokens_remaining': self.current_tokens,
+                        'queue_size': len(self._token_queue),
+                        'wait_time': total_wait,
+                        'request_time': request_time,
+                        'cleaned_tokens': cleaned_tokens
+                    })
+                )
+                
+                # Log statistics periodically
+                if self._stats['total_requests'] % 100 == 0:  # Every 100 requests
+                    self._log_statistics()
+                    
+        except asyncio.CancelledError:
+            logger.warning(
+                "Token acquisition cancelled after %.2fs",
+                time.monotonic() - start_time
             )
-            
-            # Log detailed acquisition info
-            logger.info(
-                "Token acquisition completed - Stats: %s",
-                json.dumps({
-                    'tokens_requested': tokens,
-                    'tokens_remaining': self.current_tokens,
-                    'queue_size': len(self._token_queue),
-                    'wait_time': total_wait,
-                    'request_time': request_time,
-                    'cleaned_tokens': cleaned_tokens
-                })
+            raise
+        except Exception as e:
+            logger.error(
+                "Token acquisition failed: %s",
+                str(e),
+                exc_info=True
             )
-            
-            # Log statistics periodically
-            if self._stats['total_requests'] % 100 == 0:  # Every 100 requests
-                self._log_statistics()
+            raise RateLimitError(f"Failed to acquire tokens: {str(e)}")
     
     def _log_statistics(self) -> None:
         """Log rate limiter statistics."""

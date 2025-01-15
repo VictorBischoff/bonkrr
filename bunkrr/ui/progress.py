@@ -228,52 +228,93 @@ class ProgressTracker:
     
     def update_progress(self, advance: int = 1, downloaded: int = 0, failed: bool = False):
         """Update download progress."""
+        if advance < 0:
+            logger.warning("Negative progress update ignored: %d", advance)
+            return
+            
+        if downloaded < 0:
+            logger.warning("Negative download size ignored: %d", downloaded)
+            return
+            
         start_time = time.time()
         
-        if failed:
-            self.stats.failed_files += advance
-            self.stats.failure_timestamps.append(time.time())
-            logger.warning(
-                "Download failed - Album: %s, Failed count: %d",
+        try:
+            if failed:
+                self.stats.failed_files += advance
+                self.stats.failure_timestamps.append(time.time())
+                logger.warning(
+                    "Download failed - Album: %s, Failed count: %d",
+                    self.current_album,
+                    self.stats.failed_files
+                )
+            else:
+                self.stats.completed_files += advance
+                self.stats.downloaded_size += downloaded
+                
+                # Track performance metrics
+                download_time = time.time() - start_time
+                if download_time > 0:  # Avoid division by zero
+                    speed = downloaded / download_time
+                    
+                    self.stats.download_times.append(download_time)
+                    self.stats.download_speeds.append(speed)
+                    
+                    logger.debug(
+                        "Download completed - Album: %s, Size: %s, Speed: %.2f MB/s, Time: %.2fs",
+                        self.current_album,
+                        humanize.naturalsize(downloaded, binary=True),
+                        speed / (1024 * 1024),
+                        download_time
+                    )
+                
+            # Update progress bars
+            try:
+                if self.current_task_id is not None:
+                    self.progress.update(self.current_task_id, advance=advance)
+                if self.total_task_id is not None:
+                    self.total_progress.update(self.total_task_id, advance=advance)
+            except Exception as e:
+                logger.error("Failed to update progress bars: %s", str(e))
+            
+            # Log progress periodically
+            total_processed = self.stats.completed_files + self.stats.failed_files
+            if total_processed > 0 and total_processed % 10 == 0:
+                logger.info(
+                    "Download progress - Completed: %d, Failed: %d, Success rate: %.2f%%, "
+                    "Downloaded: %s",
+                    self.stats.completed_files,
+                    self.stats.failed_files,
+                    self.stats.success_rate,
+                    self.stats.formatted_downloaded_size
+                )
+            
+            # Update display
+            if self.live:
+                try:
+                    self.live.update(self._generate_layout())
+                except Exception as e:
+                    logger.error("Failed to update display: %s", str(e))
+                    # Try to recreate display if update fails
+                    try:
+                        if self.live:
+                            self.live.stop()
+                        self.live = Live(
+                            self._generate_layout(),
+                            console=self.console,
+                            refresh_per_second=4,
+                            transient=True
+                        )
+                        self.live.start()
+                    except Exception as e2:
+                        logger.error("Failed to recreate display: %s", str(e2))
+                    
+        except Exception as e:
+            logger.error(
+                "Error updating progress - Album: %s, Error: %s",
                 self.current_album,
-                self.stats.failed_files
+                str(e),
+                exc_info=True
             )
-        else:
-            self.stats.completed_files += advance
-            self.stats.downloaded_size += downloaded
-            
-            # Track performance metrics
-            download_time = time.time() - start_time
-            speed = downloaded / download_time if download_time > 0 else 0
-            
-            self.stats.download_times.append(download_time)
-            self.stats.download_speeds.append(speed)
-            
-            logger.debug(
-                "Download completed - Album: %s, Size: %s, Speed: %.2f MB/s, Time: %.2fs",
-                self.current_album,
-                humanize.naturalsize(downloaded, binary=True),
-                speed / (1024 * 1024),
-                download_time
-            )
-            
-        if self.current_task_id:
-            self.progress.update(self.current_task_id, advance=advance)
-        self.total_progress.update(self.total_task_id, advance=advance)
-        
-        # Log progress periodically
-        if (self.stats.completed_files + self.stats.failed_files) % 10 == 0:
-            logger.info(
-                "Download progress - Completed: %d, Failed: %d, Success rate: %.2f%%, "
-                "Downloaded: %s",
-                self.stats.completed_files,
-                self.stats.failed_files,
-                self.stats.success_rate,
-                self.stats.formatted_downloaded_size
-            )
-        
-        if self.live:
-            self.live.update(self._generate_layout())
     
     def _generate_layout(self) -> Panel:
         """Generate rich layout with progress and stats."""

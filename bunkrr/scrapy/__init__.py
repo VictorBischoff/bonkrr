@@ -1,13 +1,13 @@
 """Scrapy integration for the bunkrr package."""
 from .processor import MediaProcessor
-from .pipelines import BunkrFilesPipeline, BunkrDownloadPipeline
-from .middlewares import CustomRateLimiterMiddleware
+from .pipelines import MediaPipeline, DownloadPipeline
+from .middlewares import RateLimitMiddleware
 from .spiders.bunkr_spider import BunkrSpider
 
 __all__ = [
     'MediaProcessor',
-    'BunkrFilesPipeline',
-    'BunkrDownloadPipeline',
-    'CustomRateLimiterMiddleware',
+    'MediaPipeline',
+    'DownloadPipeline',
+    'RateLimitMiddleware',
     'BunkrSpider'
 ]

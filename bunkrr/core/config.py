@@ -42,6 +42,24 @@ from .logger import setup_logger
 
 logger = setup_logger('bunkrr.config')
 
+class ConfigJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder for configuration objects."""
+    
+    def default(self, obj: Any) -> Any:
+        """Handle special types during JSON encoding.
+        
+        Args:
+            obj: Object to encode
+            
+        Returns:
+            JSON serializable representation
+        """
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, Enum):
+            return obj.value
+        return super().default(obj)
+
 class ConfigValidationTracker:
     """Track configuration validation and changes."""
     
@@ -74,7 +92,7 @@ class ConfigValidationTracker:
             "Configuration validation - Type: %s, Success: %s, Details: %s",
             config_type,
             success,
-            json.dumps(details or {})
+            json.dumps(details or {}, cls=ConfigJSONEncoder)
         )
     
     def add_change(self, config_type: str, field: str, old_value: Any, new_value: Any) -> None:
@@ -92,8 +110,8 @@ class ConfigValidationTracker:
             "Configuration changed - Type: %s, Field: %s, Old: %s, New: %s",
             config_type,
             field,
-            old_value,
-            new_value
+            json.dumps(old_value, cls=ConfigJSONEncoder),
+            json.dumps(new_value, cls=ConfigJSONEncoder)
         )
     
     def get_stats(self) -> Dict[str, Any]:
@@ -109,7 +127,7 @@ class ConfigValidationTracker:
         
         logger.debug(
             "Configuration stats - %s",
-            json.dumps(stats, indent=2)
+            json.dumps(stats, cls=ConfigJSONEncoder, indent=2)
         )
         return stats
 
@@ -244,12 +262,13 @@ class ScrapyConfig:
         settings = {
             key: getattr(self, key)
             for key in self.__dataclass_fields__
-            if not key.startswith('_')
+            if not key.startswith('_') and key != 'VERSION'  # Exclude VERSION field
         }
+        settings['version'] = str(self.VERSION.value)  # Add version as string
         
         logger.debug(
             "Converted ScrapyConfig to dict - Settings: %s",
-            json.dumps(settings)
+            json.dumps(settings, cls=ConfigJSONEncoder)
         )
         return settings
     
@@ -356,6 +375,9 @@ class DownloadConfig:
     total_timeout: int = 600
     keep_alive_timeout: int = 60
     
+    # Path settings
+    downloads_path: Path = field(default_factory=lambda: Path.home() / 'Downloads' / 'bunkrr')
+    
     # Rate limiting
     requests_per_window: int = 5
     window_size: int = 60  # seconds
@@ -374,6 +396,30 @@ class DownloadConfig:
             self.VERSION.value
         )
         self.validate()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary.
+        
+        Returns:
+            Dictionary representation of the configuration
+        """
+        config_dict = {
+            'version': str(self.VERSION.value),  # Convert enum to string
+            'max_concurrent_downloads': self.max_concurrent_downloads,
+            'chunk_size': self.chunk_size,
+            'buffer_size': self.buffer_size,
+            'connect_timeout': self.connect_timeout,
+            'read_timeout': self.read_timeout,
+            'total_timeout': self.total_timeout,
+            'keep_alive_timeout': self.keep_alive_timeout,
+            'downloads_path': str(self.downloads_path),
+            'requests_per_window': self.requests_per_window,
+            'window_size': self.window_size,
+            'dns_cache_ttl': self.dns_cache_ttl,
+            'url_cache_size': self.url_cache_size,
+            'scrapy': self.scrapy.to_dict()
+        }
+        return config_dict
     
     def validate(self) -> None:
         """Validate configuration settings.
