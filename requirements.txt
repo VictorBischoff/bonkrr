@@ -33,3 +33,7 @@ uvloop==0.21.0
 yarl==1.18.3
 aiohttp_client_cache==0.11.0
 lxml==5.0.0
+Scrapy==2.11.0
+scrapy-playwright==0.0.34
+scrapy-rotating-proxies==0.6.2
+scrapy-user-agents==0.1.1

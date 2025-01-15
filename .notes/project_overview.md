@@ -9,48 +9,68 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Real-time progress tracking with rich terminal UI
 - Concurrent download management
 - Automatic file organization
-- Robust error handling and logging
+- Comprehensive error handling and logging
 - Optimized URL validation with caching
 
 ## Technical Architecture
 
 ### Core Components
-1. **Downloader (`downloader.py`)**
-   - Main orchestrator for download processes
-   - Handles user input and download coordination
-   - Manages download sessions and retries
+1. **Core (`core/`)**
+   - Configuration management (`config.py`)
+   - Error handling system (`error_handler.py`, `exceptions.py`)
+   - Logging utilities (`logger.py`)
 
-2. **Media Processor (`data_processing.py`)**
-   - Handles media file processing and downloads
-   - Implements rate limiting and concurrent downloads
-   - Manages file system operations
-   - Provides optimized CDN selection
+2. **Downloader (`downloader/`)**
+   - Download management (`downloader.py`)
+   - Rate limiting (`rate_limiter.py`)
+   - Connection pooling and session management
 
-3. **User Interface (`ui.py`)**
-   - Rich terminal interface with progress bars
-   - Real-time statistics display
-   - Download status tracking
-   - Error and warning visualization
+3. **Scrapy Integration (`scrapy/`)**
+   - Media processing (`processor.py`)
+   - Custom pipelines (`pipelines.py`)
+   - Middleware components (`middlewares.py`)
+   - Spider implementations (`spiders/`)
 
-4. **Configuration (`config.py`)**
-   - Centralized configuration management
-   - Download settings and limits
-   - Rate limiting parameters
-   - File validation rules
+4. **User Interface (`ui/`)**
+   - Console interface (`console.py`)
+   - Theme management (`themes.py`)
+   - Progress tracking (`progress.py`)
 
-5. **Input Handler (`user_input.py`)**
-   - High-performance URL validation
-   - Pre-compiled regex patterns
-   - LRU caching for validation results
-   - Robust domain and path validation
-   - Efficient URL normalization
-   - User input management
-   - File path handling
+5. **Utilities (`utils/`)**
+   - Input validation (`input.py`)
+   - Filesystem operations (`filesystem.py`)
+   - HTTP utilities (`http.py`)
+   - Formatting helpers (`formatting.py`)
 
-6. **Logger (`logger.py`)**
-   - Structured logging system
-   - Error tracking and reporting
-   - Debug information collection
+### Error Handling System
+1. **Exception Hierarchy**
+   - `BunkrrError` - Base exception class
+   - Specialized exceptions for different error types:
+     - `ConfigError` - Configuration issues
+     - `ValidationError` - Input validation failures
+     - `DownloadError` - Download-related problems
+     - `RateLimitError` - Rate limiting issues
+     - `FileSystemError` - File operations
+     - `ScrapyError` - Scrapy integration
+     - `HTTPError` - HTTP communication
+
+2. **Error Handler**
+   - Centralized error handling through `ErrorHandler` class
+   - Consistent error logging and reporting
+   - Error context tracking and preservation
+   - Structured error information collection
+
+3. **Error Decorators**
+   - `@handle_errors` - For synchronous functions
+   - `@handle_async_errors` - For asynchronous functions
+   - Automatic error wrapping and context tracking
+   - Configurable error reraising
+
+4. **Error Reporting**
+   - Detailed error messages with context
+   - Structured error information in logs
+   - Error code categorization
+   - Stack trace preservation
 
 ### Performance Features
 - Concurrent downloads (max 6 simultaneous)
@@ -70,14 +90,6 @@ Bunkrr is a high-performance media downloader application designed to efficientl
   - Total: 600s
 - Connection keep-alive (60s timeout)
 - Connection monitoring and metrics
-
-### Error Handling
-- Automatic retries with exponential backoff
-- Rate limit detection and handling
-- Network error recovery
-- File system error management
-- Detailed error logging
-- Robust URL validation with clear error messages
 
 ### File Management
 - Unique folder name generation
@@ -102,6 +114,37 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Security considerations
 - Pre-compiled regex patterns
 - Efficient data structures (sets, LRU caches)
+
+### Error Handling Best Practices
+1. **Use Appropriate Exception Types**
+   - Choose specific exception types for different error scenarios
+   - Include relevant context information
+   - Provide clear error messages
+
+2. **Error Decorator Usage**
+   ```python
+   @handle_errors(target_error=DownloadError, context='download_operation')
+   def download_file(url: str) -> bool:
+       # Function implementation
+       pass
+
+   @handle_async_errors(target_error=HTTPError, context='api_request')
+   async def make_request(url: str) -> dict:
+       # Async function implementation
+       pass
+   ```
+
+3. **Manual Error Handling**
+   ```python
+   try:
+       # Operation that might fail
+       pass
+   except Exception as e:
+       ErrorHandler.handle_error(
+           FileSystemError("Operation failed", path=str(path)),
+           context="file_operation"
+       )
+   ```
 
 ### Testing
 - Unit tests for core functionality

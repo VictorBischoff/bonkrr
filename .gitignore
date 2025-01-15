@@ -1,3 +1,9 @@
+# Tasks
+.tasks/
+
+# Notes
+.notes/
+
 # Python
 __pycache__/
 *.py[cod]
