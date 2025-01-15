@@ -2,20 +2,78 @@
 import asyncio
 import re
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 from urllib.parse import unquote, urlparse, urljoin, parse_qs
+import io
 
-from aiohttp import ClientSession, ClientTimeout, client_exceptions, TCPConnector
-from bs4 import BeautifulSoup
+from aiohttp import (
+    ClientSession, 
+    ClientTimeout, 
+    client_exceptions, 
+    TCPConnector,
+    ClientResponse,
+    TraceConfig
+)
+from bs4 import BeautifulSoup, SoupStrainer
 from fake_useragent import UserAgent
 import aiofiles
+import aiofiles.os
 
 from .config import DownloadConfig
 from .logger import setup_logger, log_exception, log_html_error
 from .ui import DownloadProgress
 
 logger = setup_logger('bunkrr.processor')
+
+# Connection pool settings
+MAX_CONNECTIONS_PER_HOST = 8
+DNS_CACHE_TTL = 300  # 5 minutes
+KEEPALIVE_TIMEOUT = 60  # 1 minute
+POOL_TIMEOUT = 30  # Pool acquisition timeout
+
+# Request timeouts (in seconds)
+CONNECT_TIMEOUT = 30
+READ_TIMEOUT = 300  # Longer timeout for downloads
+TOTAL_TIMEOUT = 600  # Overall request timeout
+
+# Optimize file I/O with larger buffer sizes
+DOWNLOAD_CHUNK_SIZE = 64 * 1024  # 64KB chunks for downloads
+WRITE_BUFFER_SIZE = 1024 * 1024  # 1MB write buffer
+
+# File operation helpers
+async def write_buffered(file, data: bytes, buffer: io.BytesIO):
+    """Write data using a buffer to reduce I/O operations."""
+    buffer.write(data)
+    if buffer.tell() >= WRITE_BUFFER_SIZE:
+        await file.write(buffer.getvalue())
+        buffer.seek(0)
+        buffer.truncate()
+
+async def flush_buffer(file, buffer: io.BytesIO):
+    """Flush remaining data in buffer to file."""
+    if buffer.tell() > 0:
+        await file.write(buffer.getvalue())
+        buffer.seek(0)
+        buffer.truncate()
+
+# Optimize parsing by defining strainers for different content types
+ALBUM_STRAINER = SoupStrainer(lambda tag, attrs: 
+    tag == 'meta' and 'og:title' == attrs.get('property', '') or
+    tag == 'h1' and 'truncate' in attrs.get('class', []) or
+    tag == 'div' and 'theItem' in attrs.get('class', []) or
+    tag == 'a' and 'download' == attrs.get('aria-label', '') or
+    tag == 'p' and ('display:none;' == attrs.get('style', '') or 'theSize' in attrs.get('class', [])) or
+    tag == 'span' and ('theDate' in attrs.get('class', []) or 'font-semibold' in attrs.get('class', [])) or
+    tag == 'img' and 'grid-images_box-img' in attrs.get('class', [])
+)
+MEDIA_STRAINER = SoupStrainer(['video', 'source', 'img'])
+
+@lru_cache(maxsize=100)
+def create_soup(content: str, parser: str = 'lxml', strainer: Optional[SoupStrainer] = None) -> BeautifulSoup:
+    """Create BeautifulSoup object with caching and optimized parsing."""
+    return BeautifulSoup(content, parser, parse_only=strainer)
 
 class MediaProcessor:
     """Handle media processing and downloading with improved organization."""
@@ -37,18 +95,28 @@ class MediaProcessor:
     
     def __init__(self, config: DownloadConfig):
         self.config = config
-        # Increase connection pool limits
+        # Enhanced connection pool configuration
         connector = TCPConnector(
             limit=config.max_concurrent_downloads * 2,  # Double the connection pool
-            ttl_dns_cache=300,  # Cache DNS results for 5 minutes
-            enable_cleanup_closed=True,
-            force_close=False  # Allow connection reuse
+            limit_per_host=MAX_CONNECTIONS_PER_HOST,  # Limit connections per host
+            ttl_dns_cache=DNS_CACHE_TTL,  # Cache DNS results
+            enable_cleanup_closed=True,  # Clean up closed connections
+            force_close=False,  # Allow connection reuse
+            keepalive_timeout=KEEPALIVE_TIMEOUT,  # Keep connections alive
         )
+        
+        # Create trace config for connection monitoring
+        trace_config = TraceConfig()
+        trace_config.on_connection_queued_start.append(self._on_connection_queued_start)
+        trace_config.on_connection_queued_end.append(self._on_connection_queued_end)
+        trace_config.on_connection_create_start.append(self._on_connection_create_start)
+        trace_config.on_connection_create_end.append(self._on_connection_create_end)
         
         self._download_semaphore = asyncio.Semaphore(config.max_concurrent_downloads)
         self._rate_limiter = RateLimiter(config.rate_limit, config.rate_window)
         self._session: Optional[ClientSession] = None
         self._connector = connector
+        self._trace_config = trace_config
         self._processed_urls: Set[str] = set()
         self._url_pattern = re.compile(r'/[aif]/([A-Za-z0-9]+)')  # Precompile regex
         self._progress = DownloadProgress()
@@ -59,28 +127,164 @@ class MediaProcessor:
                 "max_concurrent_downloads": config.max_concurrent_downloads,
                 "rate_limit": config.rate_limit,
                 "rate_window": config.rate_window,
-                "connection_pool_size": config.max_concurrent_downloads * 2
+                "connection_pool_size": config.max_concurrent_downloads * 2,
+                "connections_per_host": MAX_CONNECTIONS_PER_HOST,
+                "keepalive_timeout": KEEPALIVE_TIMEOUT
             }
         )
-
+        
     async def __aenter__(self):
         """Set up async context with improved session configuration."""
         if not self._session:
-            timeout = ClientTimeout(total=self.config.download_timeout)
+            # Configure timeouts for different operations
+            timeout = ClientTimeout(
+                total=TOTAL_TIMEOUT,
+                connect=CONNECT_TIMEOUT,
+                sock_read=READ_TIMEOUT
+            )
+            
             self._session = ClientSession(
                 connector=self._connector,
                 timeout=timeout,
-                raise_for_status=True
+                raise_for_status=True,
+                trace_configs=[self._trace_config]
             )
-            logger.debug("Created new ClientSession")
+            
+            logger.debug(
+                "Created new ClientSession with timeouts: total=%ds, connect=%ds, read=%ds",
+                TOTAL_TIMEOUT,
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT
+            )
         return self
-
+        
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Clean up resources properly."""
+        """Clean up resources properly with graceful shutdown."""
         if self._session:
-            await self._session.close()
-            await self._connector.close()
+            try:
+                # Wait for ongoing requests to complete (up to 30 seconds)
+                await asyncio.wait_for(self._session.close(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("Session close timed out, forcing close")
+            finally:
+                await self._connector.close()
+                
         logger.debug("Closed ClientSession and Connector")
+        
+    # Connection pool monitoring callbacks
+    async def _on_connection_queued_start(self, session, trace_config_ctx, params):
+        logger.debug("Connection queued: waiting for pool slot")
+        
+    async def _on_connection_queued_end(self, session, trace_config_ctx, params):
+        logger.debug("Connection dequeued: acquired from pool")
+        
+    async def _on_connection_create_start(self, session, trace_config_ctx, params):
+        logger.debug("Creating new connection")
+        
+    async def _on_connection_create_end(self, session, trace_config_ctx, params):
+        logger.debug("New connection created")
+        
+    async def _make_request(
+        self,
+        method: str,
+        url: str,
+        **kwargs
+    ) -> ClientResponse:
+        """Make an HTTP request with automatic retry and connection management."""
+        retry_count = 0
+        max_retries = self.config.max_retries
+        
+        while retry_count < max_retries:
+            try:
+                # Add default headers for better connection handling
+                headers = kwargs.get('headers', {})
+                headers.update({
+                    'Connection': 'keep-alive',
+                    'Keep-Alive': f'timeout={KEEPALIVE_TIMEOUT}',
+                    'Accept-Encoding': 'gzip, deflate',
+                })
+                kwargs['headers'] = headers
+                
+                # Attempt the request
+                response = await self._session.request(method, url, **kwargs)
+                
+                # Update pool metrics
+                active_connections = len(self._connector._conns)
+                acquired_connections = len(self._connector._acquired)
+                logger.debug(
+                    "Connection pool status - Active: %d, Acquired: %d",
+                    active_connections,
+                    acquired_connections
+                )
+                
+                return response
+                
+            except (client_exceptions.ServerTimeoutError,
+                   client_exceptions.ClientConnectorError,
+                   client_exceptions.ClientConnectionError,  # Base class
+                   client_exceptions.ServerDisconnectedError,
+                   client_exceptions.ClientPayloadError,  # Add payload errors
+                   client_exceptions.ClientOSError,  # Add OS errors
+                   asyncio.TimeoutError) as e:  # Add asyncio timeout
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = self.config.retry_delay * (2 ** (retry_count - 1))
+                    logger.warning(
+                        "Connection error for %s, retrying in %ds (%d/%d): %s",
+                        url, wait_time, retry_count, max_retries, str(e)
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise  # Re-raise the last error
+                
+    async def _fetch_data(self, url: str, data_type: str) -> Optional[Dict[str, Any]]:
+        """Fetch data with improved connection handling."""
+        logger.debug("Fetching %s data from: %s", data_type, url)
+        
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        headers = {'User-Agent': self._get_random_user_agent(), 'Referer': base_url}
+        
+        async with self._download_semaphore:  # Limit concurrent requests
+            await self._rate_limiter.acquire()
+            
+            try:
+                async with await self._make_request(
+                    'GET',
+                    url,
+                    headers=headers,
+                    allow_redirects=True,
+                    ssl=False,  # Skip SSL verification for performance
+                    timeout=ClientTimeout(
+                        total=TOTAL_TIMEOUT,
+                        connect=CONNECT_TIMEOUT,
+                        sock_read=READ_TIMEOUT
+                    )
+                ) as response:
+                    status = response.status
+                    content = await response.text()
+                    
+                    if status == 200:
+                        # Use appropriate strainer based on data type
+                        strainer = ALBUM_STRAINER if data_type == "album-info" else MEDIA_STRAINER
+                        soup = create_soup(content, 'lxml', strainer)
+                        return (await self._parse_album_info(soup, url, base_url) if data_type == "album-info"
+                              else await self._parse_media_info(soup, base_url))
+                              
+                    elif status == 429:  # Rate limit
+                        retry_delay = int(response.headers.get('Retry-After', 30))
+                        logger.warning("Rate limited, waiting %ds", retry_delay)
+                        await asyncio.sleep(retry_delay)
+                        return await self._fetch_data(url, data_type)  # Retry
+                        
+                    # Log error and return None
+                    log_html_error(logger, status, url, content)
+                    return None
+                    
+            except Exception as e:
+                log_exception(logger, e, f"fetching {data_type}")
+                return None
 
     async def process_album(self, album_url: str, parent_folder: Path) -> Tuple[int, int]:
         """Process a single album URL with optimized batch processing."""
@@ -231,10 +435,11 @@ class MediaProcessor:
         url: str,
         file_path: Path
     ) -> Tuple[bool, int]:
-        """Download a single file with improved error handling."""
+        """Download a single file with improved error handling and I/O optimization."""
         temp_path = file_path.with_suffix('.part')
         retry_count = 0
         max_retries = self.config.max_retries
+        write_buffer = io.BytesIO()
         
         while retry_count < max_retries:
             try:
@@ -307,13 +512,17 @@ class MediaProcessor:
                         # Open file in append mode if it exists and is incomplete
                         mode = 'ab' if temp_path.exists() else 'wb'
                         downloaded_size = 0
-                        async with aiofiles.open(temp_path, mode) as f:
-                            async for chunk in response.content.iter_chunked(8192):
+                        
+                        # Use buffered writes for better I/O performance
+                        async with aiofiles.open(temp_path, mode, buffering=WRITE_BUFFER_SIZE) as f:
+                            async for chunk in response.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
                                 if asyncio.current_task().cancelled():
                                     logger.info("Download cancelled: %s", file_path.name)
                                     raise asyncio.CancelledError()
-                                await f.write(chunk)
+                                await write_buffered(f, chunk, write_buffer)
                                 downloaded_size += len(chunk)
+                            # Flush any remaining data
+                            await flush_buffer(f, write_buffer)
 
                         # If we got here, the download was successful
                         break
@@ -321,7 +530,7 @@ class MediaProcessor:
             except asyncio.CancelledError:
                 logger.info("Download cancelled: %s", file_path.name)
                 if temp_path.exists():
-                    temp_path.unlink()
+                    await aiofiles.os.remove(temp_path)
                 raise
             except Exception as e:
                 log_exception(logger, e, f"downloading {url}")
@@ -330,22 +539,35 @@ class MediaProcessor:
                     await asyncio.sleep(self.config.retry_delay)
                     continue
                 if temp_path.exists():
-                    temp_path.unlink()
+                    await aiofiles.os.remove(temp_path)
                 return False, 0
 
         # Verify download
-        if not temp_path.exists() or temp_path.stat().st_size < self.config.min_file_size:
-            logger.error(
-                "Downloaded file too small: %s (%d bytes)",
-                file_path.name,
-                temp_path.stat().st_size if temp_path.exists() else 0
-            )
+        try:
+            file_size = (await aiofiles.os.stat(temp_path)).st_size
+            if file_size < self.config.min_file_size:
+                logger.error(
+                    "Downloaded file too small: %s (%d bytes)",
+                    file_path.name,
+                    file_size
+                )
+                await aiofiles.os.remove(temp_path)
+                return False, 0
+        except Exception as e:
+            log_exception(logger, e, f"verifying file size for {file_path.name}")
             if temp_path.exists():
-                temp_path.unlink()
+                await aiofiles.os.remove(temp_path)
             return False, 0
 
-        # Rename temp file to final name
-        temp_path.rename(file_path)
+        # Rename temp file to final name using async rename
+        try:
+            await aiofiles.os.rename(temp_path, file_path)
+        except Exception as e:
+            log_exception(logger, e, f"renaming {temp_path} to {file_path}")
+            if temp_path.exists():
+                await aiofiles.os.remove(temp_path)
+            return False, 0
+            
         return True, downloaded_size
 
     def _get_random_user_agent(self) -> str:
@@ -358,7 +580,7 @@ class MediaProcessor:
         except Exception as e:
             log_exception(logger, e, "user agent generation")
             return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            
+        
     def _extract_album_id(self, url: str) -> Optional[str]:
         """Extract album ID using precompiled regex."""
         if match := self._url_pattern.search(url):
@@ -368,68 +590,20 @@ class MediaProcessor:
         logger.error("No matching pattern found for URL: %s", url)
         return None
         
-    async def _fetch_data(self, url: str, data_type: str) -> Optional[Dict[str, Any]]:
-        """Fetch data with connection pooling and optimized retries."""
-        logger.debug("Fetching %s data from: %s", data_type, url)
-        
-        parsed_url = urlparse(url)
-        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        headers = {'User-Agent': self._get_random_user_agent(), 'Referer': base_url}
-        
-        for retry_count in range(self.config.max_retries):
-            try:
-                async with self._download_semaphore:  # Limit concurrent requests
-                    await self._rate_limiter.acquire()
-                    
-                    async with self._session.get(
-                        url, 
-                        headers=headers,
-                        allow_redirects=True,
-                        ssl=False  # Skip SSL verification for performance
-                    ) as response:
-                        status = response.status
-                        content = await response.text()
-                        
-                        if status == 200:
-                            soup = BeautifulSoup(content, 'html.parser')
-                            return (await self._parse_album_info(soup, url, base_url) if data_type == "album-info"
-                                  else await self._parse_media_info(soup, base_url))
-                                  
-                        elif status == 429:  # Rate limit
-                            retry_delay = int(response.headers.get('Retry-After', 30))
-                            logger.warning("Rate limited, waiting %ds", retry_delay)
-                            await asyncio.sleep(retry_delay)
-                            continue
-                            
-                        # Log error and retry
-                        log_html_error(logger, status, url, content)
-                        await asyncio.sleep(self.config.retry_delay * (retry_count + 1))
-                        
-            except Exception as e:
-                log_exception(logger, e, f"fetching {data_type}")
-                if retry_count < self.config.max_retries - 1:
-                    await asyncio.sleep(self.config.retry_delay * (retry_count + 1))
-                    continue
-                break
-                
-        logger.error("Failed to fetch data after %d retries: %s", self.config.max_retries, url)
-        return None
-        
     async def _parse_album_info(self, soup: BeautifulSoup, url: str, base_url: str) -> Optional[Dict[str, Any]]:
         """Parse album information from HTML with optimized selectors."""
         logger.debug("Parsing album info from HTML")
         
-        # Get album title from meta tag or h1
+        # Get album title from meta tag or h1 using optimized selectors
         title = None
-        meta_title = soup.find('meta', property='og:title')
+        meta_title = soup.find('meta', property='og:title', attrs={'content': True})
         if meta_title:
-            title = meta_title.get('content')
+            title = meta_title['content']
             logger.debug("Found title from meta: %s", title)
         else:
             h1_title = soup.find('h1', class_='truncate')
             if h1_title:
-                title = h1_title.text.strip()
+                title = h1_title.get_text(strip=True)
                 logger.debug("Found title from h1: %s", title)
         
         if not title:
@@ -437,38 +611,40 @@ class MediaProcessor:
             title = f"Album_{album_id}"
             logger.debug("Using fallback title: %s", title)
         
-        # Get album stats if available
+        # Get album stats if available using optimized selector
         stats_text = soup.find('span', class_='font-semibold')
         if stats_text:
-            logger.debug("Album stats: %s", stats_text.text.strip())
+            logger.debug("Album stats: %s", stats_text.get_text(strip=True))
         
-        # Find all media items in the grid
+        # Find all media items in the grid using optimized selectors
         media_links = set()
         media_info = []
         
-        for item in soup.find_all('div', class_='theItem'):
+        # Use CSS selector for better performance
+        for item in soup.select('div.theItem'):
             try:
-                # Get download link
-                download_link = item.find('a', attrs={'aria-label': 'download'})
-                if not download_link or not (href := download_link.get('href')):
+                # Get download link with optimized selector
+                download_link = item.find('a', attrs={'aria-label': 'download', 'href': True})
+                if not download_link:
                     continue
                     
+                href = download_link['href']
                 # Convert relative URL to absolute
                 if href.startswith('/'):
                     href = f"{base_url}{href}"
                     
-                # Get file info
+                # Get file info with optimized selectors
                 filename = item.find('p', style='display:none;')
-                filename = filename.text.strip() if filename else ''
+                filename = filename.get_text(strip=True) if filename else ''
                 
                 size_elem = item.find('p', class_='theSize')
-                size = size_elem.text.strip() if size_elem else ''
+                size = size_elem.get_text(strip=True) if size_elem else ''
                 
                 date_elem = item.find('span', class_='theDate')
-                date = date_elem.text.strip() if date_elem else ''
+                date = date_elem.get_text(strip=True) if date_elem else ''
                 
-                thumbnail = item.find('img', class_='grid-images_box-img')
-                thumbnail_url = thumbnail.get('src') if thumbnail else None
+                thumbnail = item.find('img', class_='grid-images_box-img', attrs={'src': True})
+                thumbnail_url = thumbnail['src'] if thumbnail else None
                 
                 media_info.append({
                     'url': href,
@@ -511,28 +687,28 @@ class MediaProcessor:
         }
         
     async def _parse_media_info(self, soup: BeautifulSoup, base_url: str) -> Optional[Dict[str, Any]]:
-        """Parse media information from HTML."""
+        """Parse media information from HTML with optimized selectors."""
         logger.debug("Parsing media info from HTML")
         download_url = None
         
-        # Try to find video source
+        # Try to find video source with optimized selectors
         video = soup.find('video')
         if video:
-            # Try source tag first
-            source = video.find('source')
-            if source and (src := source.get('src')):
-                download_url = src
+            # Try source tag first with optimized selector
+            source = video.find('source', attrs={'src': True})
+            if source:
+                download_url = source['src']
                 logger.debug("Found video source: %s", download_url)
             # Try direct video src
-            elif src := video.get('src'):
-                download_url = src
+            elif 'src' in video.attrs:
+                download_url = video['src']
                 logger.debug("Found direct video src: %s", download_url)
         
-        # Try to find image source
+        # Try to find image source with optimized selector
         if not download_url:
-            img = soup.find('img', class_='max-h-full')
-            if img and (src := img.get('src')):
-                download_url = src
+            img = soup.find('img', class_='max-h-full', attrs={'src': True})
+            if img:
+                download_url = img['src']
                 logger.debug("Found image source: %s", download_url)
         
         if download_url:
@@ -548,7 +724,7 @@ class MediaProcessor:
             error_details={'error': 'No download URL found'}
         )
         return None
-        
+            
     async def _get_download_url(self, file_url: str) -> Optional[str]:
         """Get the actual download URL from a file page with improved extraction."""
         try:
@@ -618,33 +794,52 @@ class MediaProcessor:
         return name[:255]
         
 class RateLimiter:
-    """Rate limiter using token bucket algorithm for better request control."""
+    """Efficient rate limiter using asyncio primitives and sliding window."""
     
     def __init__(self, rate_limit: int, window_size: int):
         self.rate_limit = rate_limit
         self.window_size = window_size
-        self.tokens = rate_limit
-        self.last_update = datetime.now().timestamp()
+        self._window = asyncio.Queue(maxsize=rate_limit)
         self._lock = asyncio.Lock()
         
     async def acquire(self):
-        """Acquire a rate limit token using token bucket algorithm."""
+        """Acquire a rate limit token using sliding window algorithm."""
         async with self._lock:
             now = datetime.now().timestamp()
             
-            # Calculate tokens to add based on time passed
-            time_passed = now - self.last_update
-            tokens_to_add = (time_passed / self.window_size) * self.rate_limit
+            # Remove expired timestamps
+            while not self._window.empty():
+                try:
+                    timestamp = self._window.get_nowait()
+                    if now - timestamp <= self.window_size:
+                        # Put it back if still valid
+                        await self._window.put(timestamp)
+                        break
+                except asyncio.QueueEmpty:
+                    break
             
-            # Update tokens and timestamp
-            self.tokens = min(self.rate_limit, self.tokens + tokens_to_add)
-            self.last_update = now
+            # Check if we can add a new request
+            if self._window.qsize() < self.rate_limit:
+                await self._window.put(now)
+                return
             
-            # If no tokens available, calculate wait time
-            if self.tokens < 1:
-                wait_time = (self.window_size / self.rate_limit) * (1 - self.tokens)
-                await asyncio.sleep(wait_time)
-                self.tokens = 1  # We'll consume this token
+            # Calculate wait time based on oldest timestamp
+            try:
+                oldest = self._window.get_nowait()
+                wait_time = max(0, self.window_size - (now - oldest))
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+                # Add current request timestamp
+                await self._window.put(now)
+            except asyncio.QueueEmpty:
+                # Queue is empty, we can proceed
+                await self._window.put(now)
                 
-            # Consume one token
-            self.tokens -= 1
+    async def reset(self):
+        """Reset the rate limiter state."""
+        async with self._lock:
+            while not self._window.empty():
+                try:
+                    self._window.get_nowait()
+                except asyncio.QueueEmpty:
+                    break

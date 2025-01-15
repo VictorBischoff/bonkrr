@@ -49,11 +49,20 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 
 ### Performance Features
 - Concurrent downloads (max 6 simultaneous)
-- Rate limiting (5 requests per 60s window)
-- Connection pooling and reuse
-- DNS result caching
-- Optimized CDN selection
-- Chunk-based downloads
+- Efficient rate limiting with sliding window algorithm (5 requests per 60s window)
+- Optimized connection pooling with per-host limits
+- DNS result caching (5 minute TTL)
+- Smart CDN selection with fallback
+- Chunk-based downloads (64KB chunks)
+- Buffered file writes (1MB buffer)
+- Optimized HTML parsing with lxml and strainers
+- BeautifulSoup result caching
+- Granular timeout management:
+  - Connect: 30s
+  - Read: 300s
+  - Total: 600s
+- Connection keep-alive (60s timeout)
+- Connection monitoring and metrics
 
 ### Error Handling
 - Automatic retries with exponential backoff
