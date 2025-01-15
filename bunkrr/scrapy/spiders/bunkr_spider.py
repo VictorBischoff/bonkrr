@@ -552,11 +552,6 @@ class BunkrSpider(Spider):
             logger.error("Error parsing %s: %s", response.url, str(e))
             self._handle_media_failure(response)
             return None
-        
-        finally:
-            # Return result object to pool if not used
-            if result and not result.get('url'):
-                self._result_pool.put(result)
     
     def _parse_album(self, response: Response) -> Dict[str, Any]:
         """Parse album page."""
