@@ -1,11 +1,11 @@
-"""Bunkrr - A media downloader for Bunkr.site."""
-from .core.config import DownloadConfig
-from .core.error_handler import (
+"""Core functionality for the bunkrr package."""
+from .config import DownloadConfig
+from .error_handler import (
     ErrorHandler,
     handle_errors,
     handle_async_errors
 )
-from .core.exceptions import (
+from .exceptions import (
     BunkrrError,
     ConfigError,
     ValidationError,
@@ -16,17 +16,11 @@ from .core.exceptions import (
     HTTPError,
     ERROR_CODES
 )
-from .core.logger import setup_logger
-from .downloader.downloader import Downloader
-from .scrapy import MediaProcessor
-from .ui.console import ConsoleUI
-
-__version__ = '0.1.0'
+from .logger import setup_logger, log_exception
 
 __all__ = [
-    # Core functionality
+    # Configuration
     'DownloadConfig',
-    'setup_logger',
     
     # Error handling
     'ErrorHandler',
@@ -44,8 +38,7 @@ __all__ = [
     'HTTPError',
     'ERROR_CODES',
     
-    # Main components
-    'Downloader',
-    'MediaProcessor',
-    'ConsoleUI'
+    # Logging
+    'setup_logger',
+    'log_exception'
 ]

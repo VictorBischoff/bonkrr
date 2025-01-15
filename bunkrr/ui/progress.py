@@ -1,8 +1,8 @@
-"""Enhanced terminal user interface for the bunkrr package."""
+"""Progress tracking for the bunkrr package."""
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+import threading
+from typing import Dict, Optional
 
 from rich.console import Console
 from rich.live import Live
@@ -19,22 +19,8 @@ from rich.progress import (
 )
 from rich.table import Table
 from rich.text import Text
-from rich.style import Style
-from rich.theme import Theme
 
-# Custom theme for consistent styling
-THEME = Theme({
-    "info": "cyan",
-    "warning": "yellow",
-    "error": "red",
-    "success": "green",
-    "progress.percentage": "cyan",
-    "progress.download": "green",
-    "progress.data.speed": "cyan",
-    "url": "blue underline",
-    "filename": "bright_cyan",
-    "stats": "magenta"
-})
+from .themes import DEFAULT_THEME
 
 @dataclass
 class DownloadStats:
@@ -60,15 +46,29 @@ class DownloadStats:
             return 0
         return (datetime.now() - self.start_time).total_seconds()
 
-class DownloadProgress:
-    """Enhanced download progress tracking with rich UI."""
+class ProgressTracker:
+    """Singleton progress tracker for unified progress tracking."""
+    _instance = None
+    _lock = threading.Lock()
     
-    def __init__(self, console: Optional[Console] = None):
-        self.console = console or Console(theme=THEME)
-        self.stats = DownloadStats()
-        self.current_album: Optional[str] = None
-        
-        # Create progress bars with enhanced columns
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
+    
+    def __init__(self):
+        if not hasattr(self, 'initialized'):
+            self.console = Console(theme=DEFAULT_THEME)
+            self.stats = DownloadStats()
+            self.current_album = None
+            self.album_items = {}
+            self.live = None
+            self._setup_progress_bars()
+            self.initialized = True
+    
+    def _setup_progress_bars(self):
+        """Set up progress bars with enhanced columns."""
         self.progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -81,7 +81,6 @@ class DownloadProgress:
             expand=True
         )
         
-        # Create overall progress
         self.total_progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(complete_style="progress.percentage"),
@@ -91,35 +90,37 @@ class DownloadProgress:
             expand=True
         )
         
-        # Task IDs for progress tracking
         self.total_task_id = self.total_progress.add_task(
             "[bright_cyan]Overall Progress",
             total=None
         )
         self.current_task_id = None
-        
+    
     def start(self):
         """Start progress tracking."""
-        self.stats.start_time = datetime.now()
-        self.live = Live(
-            self._generate_layout(),
-            console=self.console,
-            refresh_per_second=4
-        )
-        self.live.start()
-        
+        if not self.live:
+            self.stats.start_time = datetime.now()
+            self.live = Live(
+                self._generate_layout(),
+                console=self.console,
+                refresh_per_second=4
+            )
+            self.live.start()
+    
     def stop(self):
         """Stop progress tracking and show summary."""
-        self.live.stop()
-        self._show_summary()
-        
+        if self.live:
+            self.live.stop()
+            self._show_summary()
+            self.live = None
+    
     def update_album(self, album_name: str, total_files: int):
         """Update current album information."""
         self.current_album = album_name
+        self.album_items[album_name] = total_files
         self.stats.total_files += total_files
         self.total_progress.update(self.total_task_id, total=self.stats.total_files)
         
-        # Create new progress bar for album
         if self.current_task_id:
             self.progress.remove_task(self.current_task_id)
         self.current_task_id = self.progress.add_task(
@@ -127,6 +128,9 @@ class DownloadProgress:
             total=total_files
         )
         
+        if self.live:
+            self.live.update(self._generate_layout())
+    
     def update_progress(self, advance: int = 1, downloaded: int = 0, failed: bool = False):
         """Update download progress."""
         if failed:
@@ -135,13 +139,15 @@ class DownloadProgress:
             self.stats.completed_files += advance
             self.stats.downloaded_size += downloaded
             
-        self.progress.update(self.current_task_id, advance=advance)
+        if self.current_task_id:
+            self.progress.update(self.current_task_id, advance=advance)
         self.total_progress.update(self.total_task_id, advance=advance)
-        self.live.update(self._generate_layout())
         
+        if self.live:
+            self.live.update(self._generate_layout())
+    
     def _generate_layout(self) -> Panel:
         """Generate rich layout with progress and stats."""
-        # Create stats table
         stats_table = Table.grid(padding=1)
         stats_table.add_row(
             Text("Files:", style="stats"),
@@ -160,14 +166,13 @@ class DownloadProgress:
             Text(f"{self.stats.elapsed_time:.0f}s", style="info")
         )
         
-        # Combine elements
         layout = Table.grid(padding=1)
         layout.add_row(Panel(stats_table, title="Download Statistics"))
         layout.add_row(Panel(self.total_progress))
         layout.add_row(Panel(self.progress, title=f"Current Album: {self.current_album or 'None'}"))
         
         return Panel(layout, title="Bunkrr Downloader", border_style="cyan")
-        
+    
     def _show_summary(self):
         """Show download summary."""
         summary = Table.grid(padding=1)
