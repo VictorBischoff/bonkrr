@@ -12,13 +12,41 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional, Set, Tuple, Union, List
+from typing import Any, Dict, Generator, Optional, Set, Tuple, Union, List, Protocol, runtime_checkable
 
 from ..core.exceptions import BunkrrError, CacheError, FileSystemError
 from ..core.logger import setup_logger
 from ..core.error_handler import ErrorHandler
 
 logger = setup_logger('bunkrr.storage')
+
+@runtime_checkable
+class Cache(Protocol):
+    """Base cache protocol defining the interface for all cache implementations."""
+    
+    def get(self, key: str) -> Optional[Any]:
+        """Get value from cache."""
+        ...
+    
+    def set(self, key: str, value: Any) -> None:
+        """Set value in cache."""
+        ...
+    
+    def delete(self, key: str) -> None:
+        """Delete value from cache."""
+        ...
+    
+    def clear(self) -> None:
+        """Clear all values from cache."""
+        ...
+    
+    def has(self, key: str) -> bool:
+        """Check if key exists in cache."""
+        ...
+    
+    def get_size(self) -> int:
+        """Get current cache size."""
+        ...
 
 @dataclass
 class CacheConfig:
@@ -338,76 +366,93 @@ class FileCache(Cache):
         """Get current cache size."""
         return self._size
 
-class SQLiteCache(Cache):
-    """SQLite-based cache implementation with connection pooling."""
+class SQLiteCache:
+    """SQLite-based cache implementation."""
     
     def __init__(self, config: CacheConfig):
         """Initialize SQLite cache."""
-        super().__init__(config)
+        super().__init__()
         if not config.db_path:
             raise CacheError("db_path is required for SQLiteCache")
             
+        self.config = config
         self.db_path = Path(config.db_path)
-        ensure_directory(self.db_path.parent)
-        
         self._connections: List[sqlite3.Connection] = []
-        self._available_connections: List[sqlite3.Connection] = []
         self._init_db()
     
     def _init_db(self) -> None:
-        """Initialize database and connection pool."""
-        # Create initial connection for setup
-        with self._get_connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    value BLOB,
-                    size INTEGER,
-                    timestamp REAL
-                )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON cache(timestamp)")
-        
-        # Initialize connection pool
-        for _ in range(self.config.pool_size):
-            conn = sqlite3.connect(
-                self.db_path,
-                isolation_level=None,  # Autocommit mode
-                check_same_thread=False
-            )
-            conn.row_factory = sqlite3.Row
-            self._connections.append(conn)
-            self._available_connections.append(conn)
+        """Initialize database schema."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        value BLOB NOT NULL,
+                        timestamp REAL NOT NULL,
+                        size INTEGER NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_timestamp 
+                    ON cache(timestamp)
+                """)
+                conn.commit()
+        except sqlite3.Error as e:
+            raise CacheError(f"Failed to initialize SQLite cache: {e}")
     
     @contextmanager
     def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        """Get a connection from the pool."""
-        connection = None
+        """Get a database connection from the pool."""
+        conn = None
         try:
-            if not self._available_connections:
+            # Try to reuse an existing connection
+            for existing_conn in self._connections:
+                try:
+                    existing_conn.execute("SELECT 1")
+                    conn = existing_conn
+                    break
+                except sqlite3.Error:
+                    continue
+            
+            # Create new connection if needed
+            if conn is None and len(self._connections) < self.config.pool_size:
+                conn = sqlite3.connect(
+                    self.db_path,
+                    timeout=30.0,
+                    isolation_level=None
+                )
+                conn.execute("PRAGMA journal_mode=WAL")
+                self._connections.append(conn)
+            
+            if conn is None:
                 raise CacheError("No available database connections")
                 
-            connection = self._available_connections.pop()
-            yield connection
-        finally:
-            if connection:
-                self._available_connections.append(connection)
+            yield conn
+            
+        except sqlite3.Error as e:
+            raise CacheError(f"Database error: {e}")
+            
+        except Exception as e:
+            raise CacheError(f"Unexpected error: {e}")
     
     def get(self, key: str) -> Optional[Any]:
         """Get value from cache."""
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT value, timestamp FROM cache WHERE key = ?",
-                (key,)
-            )
-            row = cursor.fetchone()
-            
-            if not row:
-                return None
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT value, timestamp FROM cache WHERE key = ?",
+                    (key,)
+                )
+                row = cursor.fetchone()
                 
-            try:
+                if not row:
+                    return None
+                    
+                value_bytes, timestamp = row
                 entry = CacheEntry.from_bytes(
-                    row['value'],
+                    value_bytes,
                     compress=self.config.compress
                 )
                 
@@ -417,80 +462,92 @@ class SQLiteCache(Cache):
                     
                 return entry.value
                 
-            except Exception as e:
-                logger.error("Failed to read cache entry: %s", e)
-                self.delete(key)
-                return None
+        except CacheError:
+            raise
+        except Exception as e:
+            raise CacheError(f"Failed to get value: {e}")
     
     def set(self, key: str, value: Any) -> None:
         """Set value in cache."""
-        entry = CacheEntry(value)
-        
         try:
-            data = entry.to_bytes(
+            entry = CacheEntry(value)
+            value_bytes = entry.to_bytes(
                 compress=self.config.compress,
                 level=self.config.compression_level
             )
-            size = len(data)
             
             with self._get_connection() as conn:
-                # Remove old entry if exists
-                conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+                cursor = conn.cursor()
                 
-                # Add new entry
-                conn.execute(
-                    "INSERT INTO cache (key, value, size, timestamp) VALUES (?, ?, ?, ?)",
-                    (key, data, size, entry.timestamp)
-                )
-                
-                # Evict if needed
+                # Check if we need to evict
                 if self.config.max_size is not None:
-                    current_size = conn.execute(
-                        "SELECT SUM(size) FROM cache"
-                    ).fetchone()[0] or 0
-                    
-                    if current_size > self.config.max_size:
-                        # Remove oldest entries until under limit
-                        conn.execute("""
-                            DELETE FROM cache
+                    current_size = self.get_size()
+                    if current_size + len(value_bytes) > self.config.max_size:
+                        # Remove oldest entries until we have space
+                        cursor.execute("""
+                            DELETE FROM cache 
                             WHERE key IN (
-                                SELECT key FROM cache
-                                ORDER BY timestamp ASC
+                                SELECT key FROM cache 
+                                ORDER BY timestamp ASC 
                                 LIMIT -1 OFFSET ?
                             )
-                        """, (self.config.max_size // size,))
+                        """, (self.config.batch_size,))
                 
+                # Insert or replace value
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO cache (key, value, timestamp, size)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (key, value_bytes, entry.timestamp, len(value_bytes))
+                )
+                conn.commit()
+                
+        except CacheError:
+            raise
         except Exception as e:
-            logger.error("Failed to write cache entry: %s", e)
+            raise CacheError(f"Failed to set value: {e}")
     
     def delete(self, key: str) -> None:
         """Delete value from cache."""
-        with self._get_connection() as conn:
-            conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+        try:
+            with self._get_connection() as conn:
+                conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+                conn.commit()
+        except Exception as e:
+            raise CacheError(f"Failed to delete value: {e}")
     
     def clear(self) -> None:
         """Clear all values from cache."""
-        with self._get_connection() as conn:
-            conn.execute("DELETE FROM cache")
+        try:
+            with self._get_connection() as conn:
+                conn.execute("DELETE FROM cache")
+                conn.commit()
+        except Exception as e:
+            raise CacheError(f"Failed to clear cache: {e}")
     
     def has(self, key: str) -> bool:
         """Check if key exists and is not expired."""
         return self.get(key) is not None
     
     def get_size(self) -> int:
-        """Get current cache size."""
-        with self._get_connection() as conn:
-            return conn.execute(
-                "SELECT SUM(size) FROM cache"
-            ).fetchone()[0] or 0
+        """Get current cache size in bytes."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COALESCE(SUM(size), 0) FROM cache")
+                return cursor.fetchone()[0]
+        except Exception as e:
+            raise CacheError(f"Failed to get cache size: {e}")
     
-    def __del__(self):
-        """Close all connections on deletion."""
+    def __del__(self) -> None:
+        """Close all database connections."""
         for conn in self._connections:
             try:
                 conn.close()
             except Exception:
                 pass
+        self._connections.clear()
 
 # Filesystem utilities
 def ensure_directory(path: Path) -> None:

@@ -4,7 +4,7 @@ import signal
 import sys
 import os
 from pathlib import Path
-from typing import Generator, List, Optional, Dict, Any, Set, Union
+from typing import Generator, List, Optional, Dict, Any, Set, Union, Callable, TypeVar
 from urllib.parse import urljoin
 import random
 import atexit
@@ -21,12 +21,16 @@ from ...core.config import DownloadConfig
 from ...core.logger import setup_logger
 from ...ui.progress import ProgressTracker
 from ...downloader.rate_limiter import RateLimiter
-from ...core.exceptions import ScrapyError
+from ...core.exceptions import ScrapyError, BunkrrError
 from ...core.error_handler import ErrorHandler
 
 from bs4 import BeautifulSoup, SoupStrainer
 
 logger = setup_logger('bunkrr.scrapy.spiders')
+
+# Type variables for callbacks
+T = TypeVar('T')
+CallbackType = Callable[[Response], Union[Generator[Request, None, None], Optional[Dict[str, Any]], None]]
 
 # Compile regex patterns once
 URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
@@ -244,30 +248,23 @@ class BunkrSpider(Spider):
     def _create_request(
         self,
         url: str,
-        callback,
+        callback: CallbackType,
         priority: int = 0,
         meta: Optional[Dict[str, Any]] = None
     ) -> Request:
-        """Create a request with common configuration."""
-        base_meta = {
-            'dont_redirect': True,
-            'handle_httpstatus_list': list(range(400, 600)),
-            'dont_retry': False,
-            'download_timeout': 30,
-            'max_retry_times': 3
-        }
-        
-        if meta:
-            base_meta.update(meta)
+        """Create a request with proper headers and settings."""
+        headers = self.get_headers()
+        if meta is None:
+            meta = {}
         
         return Request(
             url=url,
             callback=callback,
-            errback=self.handle_error,
-            headers=self.get_headers(),
-            meta=base_meta,
+            priority=priority,
+            headers=headers,
+            meta=meta,
             dont_filter=True,
-            priority=priority
+            errback=self.handle_error
         )
     
     def get_headers(self):
@@ -527,33 +524,29 @@ class BunkrSpider(Spider):
                 self._visited_urls.add(normalized)
                 yield Request(url=url, callback=self.parse)
     
-    def parse(self, response: Response) -> Optional[Dict]:
-        """Parse response and extract media information."""
+    def parse(self, response: Response) -> Optional[Dict[str, Any]]:
+        """Parse response and delegate to appropriate parser."""
+        if not self.running:
+            return None
+        
         try:
-            # Get result object from pool
-            result = self._result_pool.get()
-            
-            # Extract album/media ID
-            url_path = urlparse(response.url).path
-            album_match = ALBUM_ID_PATTERN.search(url_path)
-            media_match = MEDIA_ID_PATTERN.search(url_path)
-            
+            # Extract album ID from URL
+            album_match = ALBUM_ID_PATTERN.search(response.url)
             if album_match:
-                result.update(self._parse_album(response))
-            elif media_match:
-                result.update(self._parse_media(response))
-            else:
-                self._result_pool.put(result)
-                return None
+                return self._parse_album(response)
             
-            # Add common fields
-            result['url'] = response.url
-            result['timestamp'] = response.headers.get('Last-Modified')
+            # Extract media ID from URL
+            media_match = MEDIA_ID_PATTERN.search(response.url)
+            if media_match:
+                return self._parse_media(response)
             
-            return result
+            logger.warning("URL %s doesn't match any known patterns", response.url)
+            return None
             
         except Exception as e:
-            raise SpiderError(f"Failed to parse response: {e}")
+            logger.error("Error parsing %s: %s", response.url, str(e))
+            self._handle_media_failure(response)
+            return None
         
         finally:
             # Return result object to pool if not used
