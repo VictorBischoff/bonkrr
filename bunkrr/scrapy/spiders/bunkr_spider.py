@@ -4,10 +4,11 @@ import signal
 import sys
 import os
 from pathlib import Path
-from typing import Generator, List, Optional, Dict, Any, Set
+from typing import Generator, List, Optional, Dict, Any, Set, Union
 from urllib.parse import urljoin
 import random
 import atexit
+import re
 
 from scrapy import Spider, Request
 from scrapy.http import Response
@@ -21,8 +22,46 @@ from ...core.logger import setup_logger
 from ...ui.progress import ProgressTracker
 from ...downloader.rate_limiter import RateLimiter
 from ...core.exceptions import ScrapyError
+from ...core.error_handler import ErrorHandler
+
+from bs4 import BeautifulSoup, SoupStrainer
 
 logger = setup_logger('bunkrr.scrapy.spiders')
+
+# Compile regex patterns once
+URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
+ALBUM_ID_PATTERN = re.compile(r'/a/([a-zA-Z0-9]+)')
+MEDIA_ID_PATTERN = re.compile(r'/v/([a-zA-Z0-9]+)')
+
+# Create strainers once
+ALBUM_STRAINER = SoupStrainer(['meta', 'h1', 'div'], attrs={
+    'property': 'og:title',
+    'class_': ['truncate', 'theItem']
+})
+
+MEDIA_STRAINER = SoupStrainer(['img', 'p', 'span'], attrs={
+    'class_': ['grid-images_box-img', 'theSize', 'theDate']
+})
+
+class ResultPool:
+    """Pool for reusing result objects."""
+    
+    def __init__(self, max_size: int = 1000):
+        """Initialize result pool."""
+        self._items: List[Dict] = []
+        self._max_size = max_size
+    
+    def get(self) -> Dict:
+        """Get an item from the pool."""
+        if self._items:
+            return self._items.pop()
+        return {}
+    
+    def put(self, item: Dict) -> None:
+        """Return an item to the pool."""
+        if len(self._items) < self._max_size:
+            item.clear()
+            self._items.append(item)
 
 class BunkrSpider(Spider):
     """Spider for extracting media from Bunkr.site."""
@@ -128,6 +167,9 @@ class BunkrSpider(Spider):
             parent_folder,
             start_urls
         )
+        
+        self._visited_urls: Set[str] = set()
+        self._result_pool = ResultPool()
     
     def _setup_handlers(self):
         """Set up signal handlers and cleanup."""
@@ -141,13 +183,18 @@ class BunkrSpider(Spider):
             
             self._cleanup_registered = True
     
-    def _cleanup(self):
-        """Clean up resources."""
-        if not self.running:
+    def _shutdown(self, reason: str = 'shutdown', force: bool = False) -> None:
+        """Handle spider shutdown."""
+        if not self.running and not force:
             return
             
         self.running = False
-        logger.info("Cleaning up resources...")
+        logger.info(
+            "Spider shutting down (%s). Stats - Processed: %d, Failed: %d",
+            reason,
+            self.media_count,
+            self.failed_count
+        )
         
         try:
             # Stop the reactor if it's running
@@ -158,77 +205,70 @@ class BunkrSpider(Spider):
                     pass
                 except Exception as e:
                     logger.error("Error stopping reactor: %s", str(e))
-        except Exception as e:
-            logger.error("Error during cleanup: %s", str(e))
-    
-    def _handle_sigint(self, signum, frame):
-        """Handle SIGINT (Ctrl+C) gracefully."""
-        if self._shutdown_requested:  # If already shutting down, force cleanup
-            logger.info("Forced shutdown requested. Cleaning up...")
-            self._cleanup()
-            return
             
-        self._shutdown_requested = True
-        self.running = False
-        logger.info("\nReceived interrupt signal. Shutting down gracefully...")
-        logger.info("Processed %d URLs successfully, %d failed", self.media_count, self.failed_count)
-        
-        try:
-            # Close spider gracefully
-            if hasattr(self, 'crawler') and self.crawler:
-                self.crawler.engine.close_spider(self, 'shutdown_requested')
+            # Close progress tracker if exists
+            if self.progress_tracker:
+                self.progress_tracker.close()
             
-            # Cleanup will be handled by atexit handler
+            # Clean up rate limiter
+            if hasattr(self, 'rate_limiter'):
+                self.rate_limiter.close()
             
         except Exception as e:
             logger.error("Error during shutdown: %s", str(e))
-            self._cleanup()
+            if force:
+                sys.exit(1)
+
+    def _handle_sigint(self, signum, frame):
+        """Handle SIGINT (Ctrl+C) gracefully."""
+        if self._shutdown_requested:
+            logger.info("Forced shutdown requested.")
+            self._shutdown(reason='forced_shutdown', force=True)
+            return
+            
+        self._shutdown_requested = True
+        self._shutdown(reason='interrupt')
+    
+    def _cleanup(self):
+        """Clean up resources."""
+        self._shutdown(reason='cleanup', force=True)
     
     def closed(self, reason):
         """Called when the spider is closed."""
-        logger.info("Spider closed: %s", reason)
-        logger.info("Final stats - Processed: %d, Failed: %d", self.media_count, self.failed_count)
+        self._shutdown(reason=reason)
         
-        if not self.running:
-            self._cleanup()
-            
         # Don't exit here, let the cleanup handler handle it
         if reason == 'finished':
             raise DontCloseSpider("Spider finished but cleanup pending")
     
-    def start_requests(self) -> Generator[Request, None, None]:
-        """Generate initial requests from start URLs."""
-        if not self.start_urls:
-            logger.warning("No start URLs provided")
-            return
-            
-        for url in self.start_urls:
-            if not self.running:
-                break
-                
-            if url in self.processed_urls:
-                logger.debug("Skipping already processed URL: %s", url)
-                continue
-                
-            self.processed_urls.add(url)
-            logger.info("Starting request for album URL: %s", url)
-            
-            yield Request(
-                url=url,
-                callback=self.parse_album,
-                errback=self.handle_error,
-                headers=self.get_headers(),
-                meta={
-                    'album_url': url,
-                    'dont_redirect': True,
-                    'handle_httpstatus_list': list(range(400, 600)),
-                    'dont_retry': False,
-                    'download_timeout': 30,
-                    'max_retry_times': 3
-                },
-                dont_filter=True,
-                priority=1  # Higher priority for album pages
-            )
+    def _create_request(
+        self,
+        url: str,
+        callback,
+        priority: int = 0,
+        meta: Optional[Dict[str, Any]] = None
+    ) -> Request:
+        """Create a request with common configuration."""
+        base_meta = {
+            'dont_redirect': True,
+            'handle_httpstatus_list': list(range(400, 600)),
+            'dont_retry': False,
+            'download_timeout': 30,
+            'max_retry_times': 3
+        }
+        
+        if meta:
+            base_meta.update(meta)
+        
+        return Request(
+            url=url,
+            callback=callback,
+            errback=self.handle_error,
+            headers=self.get_headers(),
+            meta=base_meta,
+            dont_filter=True,
+            priority=priority
+        )
     
     def get_headers(self):
         """Get request headers with random user agent."""
@@ -285,23 +325,20 @@ class BunkrSpider(Spider):
             ]
         }
     
-    def _try_selectors(self, response: Response, selector_type: str) -> Optional[str]:
-        """Try multiple selectors and return first match."""
+    def _try_selectors(self, response: Response, selector_type: str, get_all: bool = False) -> Optional[Union[str, List[str]]]:
+        """Try multiple selectors and return first match or all matches."""
         selectors = self._get_media_selectors().get(selector_type, [])
         for selector in selectors:
-            result = response.css(selector).get()
-            if result:
-                return result.strip()
-        return None
+            results = response.css(selector).getall() if get_all else response.css(selector).get()
+            if results:
+                if get_all:
+                    return [r.strip() for r in results if r and r.strip()]
+                return results.strip()
+        return [] if get_all else None
     
     def _try_selectors_all(self, response: Response, selector_type: str) -> List[str]:
         """Try multiple selectors and return all matches."""
-        selectors = self._get_media_selectors().get(selector_type, [])
-        for selector in selectors:
-            results = response.css(selector).getall()
-            if results:
-                return [r.strip() for r in results if r and r.strip()]
-        return []
+        return self._try_selectors(response, selector_type, get_all=True) or []
     
     def parse_album(self, response: Response) -> Generator[Request, None, None]:
         """Parse album page to extract media links."""
@@ -312,10 +349,7 @@ class BunkrSpider(Spider):
         logger.debug("Parsing album page: %s (Status: %d)", album_url, response.status)
         
         try:
-            # Log response headers for debugging
-            logger.debug("Response headers: %s", response.headers)
-            
-            # Try different selectors for album title
+            # Extract album title
             album_title = self._try_selectors(response, 'album_title')
             if not album_title:
                 logger.warning("No album title found for URL: %s", album_url)
@@ -324,15 +358,12 @@ class BunkrSpider(Spider):
             album_title = album_title.strip()
             logger.debug("Found album title: %s", album_title)
             
-            # Extract media links using multiple selectors
+            # Extract media links
             media_links = self._try_selectors_all(response, 'media_links')
             
             if not media_links:
                 logger.warning("No media links found in album: %s", album_url)
-                logger.debug("Response body: %s", response.text[:1000])
-                if self.progress_tracker:
-                    self.progress_tracker.update(failed=1)
-                self.failed_count += 1
+                self._handle_media_failure(response)
                 return
             
             logger.info(
@@ -340,35 +371,22 @@ class BunkrSpider(Spider):
                 len(media_links),
                 album_title
             )
-            logger.debug("Media links found: %s", media_links)
             
             # Process each media link
             for link in media_links:
-                if not self.running:
-                    break
-                    
-                if not link:
+                if not self.running or not link:
                     continue
                     
                 media_url = urljoin(response.url, link)
                 logger.debug("Processing media URL: %s", media_url)
                 
-                yield Request(
+                yield self._create_request(
                     url=media_url,
                     callback=self.parse_media,
-                    errback=self.handle_error,
-                    headers=self.get_headers(),
                     meta={
                         'album_title': album_title,
-                        'media_url': media_url,
-                        'dont_redirect': True,
-                        'handle_httpstatus_list': list(range(400, 600)),
-                        'dont_retry': False,
-                        'download_timeout': 30,
-                        'max_retry_times': 3
-                    },
-                    dont_filter=True,
-                    priority=0  # Normal priority for media pages
+                        'media_url': media_url
+                    }
                 )
                 
         except Exception as e:
@@ -378,10 +396,60 @@ class BunkrSpider(Spider):
                 str(e),
                 exc_info=True
             )
-            if self.progress_tracker:
-                self.progress_tracker.update(failed=1)
-            self.failed_count += 1
+            self._handle_media_failure(response)
     
+    def _extract_media_info(self, response: Response) -> Optional[Dict[str, Any]]:
+        """Extract media information from response."""
+        media_type = None
+        media_src = None
+        
+        # Check for image content
+        image_src = self._try_selectors(response, 'image_src')
+        if image_src:
+            media_type = 'image'
+            media_src = image_src
+            logger.debug("Found image source: %s", image_src)
+        
+        # Check for video content
+        if not media_src:
+            video_src = self._try_selectors(response, 'video_src')
+            if video_src:
+                media_type = 'video'
+                media_src = video_src
+                logger.debug("Found video source: %s", video_src)
+        
+        # Try meta tags as fallback
+        if not media_src:
+            media_src = response.css('meta[property="og:image"]::attr(content), meta[property="og:url"]::attr(content)').get()
+            if media_src:
+                media_type = 'image' if any(ext in media_src for ext in ['.gif', '.jpg', '.jpeg', '.png', '.webp']) else 'video'
+                logger.debug("Found media source from meta tags: %s", media_src)
+        
+        return {'type': media_type, 'src': media_src} if media_src else None
+
+    def _create_media_item(
+        self,
+        response: Response,
+        download_link: str,
+        media_info: Dict[str, Any],
+        album_title: str
+    ) -> Dict[str, Any]:
+        """Create media item dictionary."""
+        thumbnail = response.css('meta[property="og:image"]::attr(content)').get()
+        file_size = self._try_selectors(response, 'file_size')
+        
+        return {
+            'file_urls': [download_link],
+            'media_type': media_info['type'],
+            'media_src': media_info['src'],
+            'thumbnail_url': thumbnail,
+            'file_size': file_size.strip() if file_size else None,
+            'album_title': album_title,
+            'source_url': response.url,
+            'filename': media_info['src'].split('/')[-1],
+            'headers': self.get_headers()
+        }
+
     def parse_media(self, response: Response) -> Optional[Dict[str, Any]]:
         """Parse media page to extract download URL."""
         if not self.running:
@@ -392,81 +460,25 @@ class BunkrSpider(Spider):
         logger.debug("Parsing media page: %s (Status: %d)", media_url, response.status)
         
         try:
-            # Log response headers for debugging
-            logger.debug("Response headers: %s", response.headers)
-            
             # Extract direct download link
             download_link = self._try_selectors(response, 'download_link')
             if not download_link:
                 logger.warning("No download link found on page: %s", response.url)
-                logger.debug("Response body: %s", response.text[:1000])
-                if self.progress_tracker:
-                    self.progress_tracker.update(failed=1)
-                self.failed_count += 1
+                self._handle_media_failure(response)
                 return None
             
             logger.debug("Found download link: %s", download_link)
             
-            # Extract media type and source
-            media_type = None
-            media_src = None
-            
-            # Check for image content
-            image_src = self._try_selectors(response, 'image_src')
-            if image_src:
-                media_type = 'image'
-                media_src = image_src
-                logger.debug("Found image source: %s", image_src)
-            
-            # Check for video content
-            if not media_src:
-                video_src = self._try_selectors(response, 'video_src')
-                if video_src:
-                    media_type = 'video'
-                    media_src = video_src
-                    logger.debug("Found video source: %s", video_src)
-            
-            if not media_src:
-                # Try meta tags
-                media_src = response.css('meta[property="og:image"]::attr(content), meta[property="og:url"]::attr(content)').get()
-                if media_src:
-                    media_type = 'image' if '.gif' in media_src or any(ext in media_src for ext in ['.jpg', '.jpeg', '.png', '.webp']) else 'video'
-                    logger.debug("Found media source from meta tags: %s", media_src)
-            
-            if not media_src:
+            # Extract media information
+            media_info = self._extract_media_info(response)
+            if not media_info:
                 logger.warning("No media source found on page: %s", response.url)
-                logger.debug("Response body: %s", response.text[:1000])
-                if self.progress_tracker:
-                    self.progress_tracker.update(failed=1)
-                self.failed_count += 1
+                self._handle_media_failure(response)
                 return None
             
-            # Get file size if available
-            file_size = self._try_selectors(response, 'file_size')
-            if file_size:
-                file_size = file_size.strip()
-                logger.debug("File size: %s", file_size)
-            
-            # Get thumbnail if available
-            thumbnail = response.css('meta[property="og:image"]::attr(content)').get()
-            
-            # Return item for pipeline processing
-            item = {
-                'file_urls': [download_link],  # Use the direct download link
-                'media_type': media_type,
-                'media_src': media_src,  # Original media source
-                'thumbnail_url': thumbnail,
-                'file_size': file_size,
-                'album_title': album_title,
-                'source_url': response.url,
-                'filename': media_src.split('/')[-1],
-                'headers': self.get_headers()  # Use same headers for file download
-            }
-            
-            self.media_count += 1
-            if self.progress_tracker:
-                self.progress_tracker.update(completed=1)
-            
+            # Create and return media item
+            item = self._create_media_item(response, download_link, media_info, album_title)
+            self._handle_media_success()
             return item
             
         except Exception as e:
@@ -476,26 +488,146 @@ class BunkrSpider(Spider):
                 str(e),
                 exc_info=True
             )
-            if self.progress_tracker:
-                self.progress_tracker.update(failed=1)
-            self.failed_count += 1
+            self._handle_media_failure(response)
             return None
+
+    def _handle_media_success(self):
+        """Handle successful media extraction."""
+        self.media_count += 1
+        if self.progress_tracker:
+            self.progress_tracker.update(completed=1)
+
+    def _handle_media_failure(self, response: Response):
+        """Handle media extraction failure."""
+        logger.debug("Response body: %s", response.text[:1000])
+        if self.progress_tracker:
+            self.progress_tracker.update(failed=1)
+        self.failed_count += 1
     
     def handle_error(self, failure):
         """Handle request failures."""
-        logger.error(
-            "Request failed for URL %s: %s",
-            failure.request.url,
-            str(failure.value),
-            exc_info=failure.getTracebackObject()
+        error = ScrapyError(
+            message=str(failure.value),
+            spider_name=self.name,
+            url=failure.request.url,
+            details=str(failure.getTracebackObject()) if failure.getTracebackObject() else None
         )
         
-        # Log additional error details
-        if hasattr(failure.value, 'response'):
-            response = failure.value.response
-            logger.debug("Error response status: %d", response.status)
-            logger.debug("Error response headers: %s", response.headers)
+        ErrorHandler.handle_error(error, context="spider_request", reraise=False)
         
         self.failed_count += 1
         if self.progress_tracker:
             self.progress_tracker.update(failed=1)
+
+    def start_requests(self) -> List[Request]:
+        """Generate initial requests."""
+        for url in self.config.start_urls:
+            normalized = normalize_url(url)
+            if normalized not in self._visited_urls:
+                self._visited_urls.add(normalized)
+                yield Request(url=url, callback=self.parse)
+    
+    def parse(self, response: Response) -> Optional[Dict]:
+        """Parse response and extract media information."""
+        try:
+            # Get result object from pool
+            result = self._result_pool.get()
+            
+            # Extract album/media ID
+            url_path = urlparse(response.url).path
+            album_match = ALBUM_ID_PATTERN.search(url_path)
+            media_match = MEDIA_ID_PATTERN.search(url_path)
+            
+            if album_match:
+                result.update(self._parse_album(response))
+            elif media_match:
+                result.update(self._parse_media(response))
+            else:
+                self._result_pool.put(result)
+                return None
+            
+            # Add common fields
+            result['url'] = response.url
+            result['timestamp'] = response.headers.get('Last-Modified')
+            
+            return result
+            
+        except Exception as e:
+            raise SpiderError(f"Failed to parse response: {e}")
+        
+        finally:
+            # Return result object to pool if not used
+            if result and not result.get('url'):
+                self._result_pool.put(result)
+    
+    def _parse_album(self, response: Response) -> Dict:
+        """Parse album page."""
+        soup = BeautifulSoup(response.text, 'lxml', parse_only=ALBUM_STRAINER)
+        result = self._result_pool.get()
+        
+        try:
+            # Extract meta title
+            meta_title = soup.find('meta', property='og:title')
+            if meta_title and meta_title.get('content'):
+                result['title'] = meta_title['content']
+            
+            # Extract h1 title
+            h1_title = soup.find('h1', class_='truncate')
+            if h1_title:
+                result['header'] = h1_title.get_text(strip=True)
+            
+            # Extract media items
+            media_items = []
+            for item in soup.find_all('div', class_='theItem'):
+                media_item = self._result_pool.get()
+                
+                # Extract file info
+                filename = item.find('p', style='display:none;')
+                if filename:
+                    media_item['filename'] = filename.get_text(strip=True)
+                
+                size = item.find('p', class_='theSize')
+                if size:
+                    media_item['size'] = size.get_text(strip=True)
+                
+                date = item.find('span', class_='theDate')
+                if date:
+                    media_item['date'] = date.get_text(strip=True)
+                
+                thumbnail = item.find('img', class_='grid-images_box-img')
+                if thumbnail and thumbnail.get('src'):
+                    media_item['thumbnail'] = thumbnail['src']
+                
+                media_items.append(media_item)
+            
+            result['media_items'] = media_items
+            return result
+            
+        except Exception as e:
+            self._result_pool.put(result)
+            raise SpiderError(f"Failed to parse album: {e}")
+    
+    def _parse_media(self, response: Response) -> Dict:
+        """Parse media page."""
+        soup = BeautifulSoup(response.text, 'lxml', parse_only=MEDIA_STRAINER)
+        result = self._result_pool.get()
+        
+        try:
+            # Extract media info
+            img = soup.find('img', class_='grid-images_box-img')
+            if img and img.get('src'):
+                result['url'] = img['src']
+            
+            size = soup.find('p', class_='theSize')
+            if size:
+                result['size'] = size.get_text(strip=True)
+            
+            date = soup.find('span', class_='theDate')
+            if date:
+                result['date'] = date.get_text(strip=True)
+            
+            return result
+            
+        except Exception as e:
+            self._result_pool.put(result)
+            raise SpiderError(f"Failed to parse media: {e}")

@@ -1,258 +1,113 @@
-"""Error handling utilities for the bunkrr package.
-
-This module provides centralized error handling functionality for the Bunkrr application.
-It includes decorators and utilities for consistent error handling across both synchronous
-and asynchronous code.
-
-Key Components:
-    - ErrorHandler: Central error handling class
-    - handle_errors: Decorator for synchronous functions
-    - handle_async_errors: Decorator for asynchronous functions
-
-Example Usage:
-    >>> from bunkrr.core.error_handler import handle_errors
-    >>> from bunkrr.core.exceptions import ValidationError
-    >>>
-    >>> @handle_errors(target_error=ValidationError, context='validate_url')
-    ... def validate_url(url: str) -> bool:
-    ...     if not url.startswith('http'):
-    ...         raise ValueError("Invalid URL scheme")
-    ...     return True
-    >>>
-    >>> # The error will be wrapped in ValidationError with context
-    >>> validate_url('ftp://example.com')  # Raises ValidationError
-
-See Also:
-    - bunkrr.core.exceptions: Exception hierarchy
-    - bunkrr.core.logger: Logging utilities
-"""
-import functools
-import sys
+"""Error handling utilities for the bunkrr package."""
+from typing import Optional, Dict, Any, Type, Callable, TypeVar, Union
+from functools import wraps
 import traceback
-from typing import Any, Callable, Dict, Optional, Type, TypeVar, Union, cast
+import inspect
 
-from .exceptions import BunkrrError, ERROR_CODES
 from .logger import setup_logger
+from .exceptions import BunkrrError
 
-logger = setup_logger('bunkrr.error_handler')
+logger = setup_logger('bunkrr.error')
 
-# Type variables for generic function handling
-F = TypeVar('F', bound=Callable[..., Any])
 T = TypeVar('T')
+F = TypeVar('F', bound=Callable[..., Any])
+
+class ErrorContext:
+    """Context manager for error handling."""
+    
+    def __init__(self, context: Optional[Dict[str, Any]] = None):
+        self.context = context or {}
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_val is not None:
+            ErrorHandler.handle(exc_val, self.context)
+        return False
 
 class ErrorHandler:
-    """Centralized error handler for the bunkrr package.
+    """Centralized error handling for the bunkrr package."""
     
-    This class provides static methods for handling errors consistently across
-    the application. It includes functionality for error wrapping, logging,
-    and context tracking.
+    _handlers: Dict[Type[Exception], Callable] = {}
     
-    Example:
-        >>> error = ValueError("Invalid input")
-        >>> error_info = ErrorHandler.handle_error(error, "validation", reraise=False)
-        >>> print(error_info['error_code'])
-        'UNKNOWN_ERROR'
-    """
+    @classmethod
+    def register(cls, error_type: Type[Exception]) -> Callable[[F], F]:
+        """Decorator to register error handler for specific error type."""
+        def decorator(handler: F) -> F:
+            cls._handlers[error_type] = handler
+            return handler
+        return decorator
     
-    @staticmethod
-    def handle_error(
-        error: Union[BunkrrError, Exception],
-        context: str,
-        reraise: bool = True
-    ) -> Dict[str, Any]:
-        """Handle an error and optionally reraise it.
+    @classmethod
+    def handle(cls, error: Exception, context: Optional[Dict[str, Any]] = None) -> None:
+        """Handle error with registered handler or default handling."""
+        error_info = {
+            'type': type(error).__name__,
+            'message': str(error),
+            'traceback': traceback.format_exc(),
+            **(context or {})
+        }
         
-        Args:
-            error: The error to handle. Can be a BunkrrError or any Exception.
-            context: String describing where the error occurred.
-            reraise: Whether to reraise the error after handling.
-            
-        Returns:
-            Dict containing error information including:
-                - type: Error class name
-                - message: Error message
-                - details: Additional error details
-                - error_code: Standardized error code
-                - context: Error context
-                - traceback: Full error traceback
-                
-        Raises:
-            The original error if reraise is True.
-            
-        Example:
-            >>> try:
-            ...     raise ValueError("Invalid value")
-            ... except Exception as e:
-            ...     error_info = ErrorHandler.handle_error(e, "validation", False)
-            ...     print(error_info['type'])
-            'ValueError'
-        """
-        error_info = ErrorHandler._create_error_info(error, context)
-        
-        # Log the error
+        handler = cls._handlers.get(type(error))
+        if handler:
+            handler(error, error_info)
+        else:
+            cls._default_handler(error, error_info)
+    
+    @classmethod
+    def _default_handler(cls, error: Exception, error_info: Dict[str, Any]) -> None:
+        """Default error handling logic."""
         if isinstance(error, BunkrrError):
             logger.error(
-                "%s: %s",
-                error_info['error_code'],
+                "Application error: %s",
                 error_info['message'],
                 extra=error_info
             )
         else:
-            logger.error(
-                "Unexpected error in %s: %s",
-                context,
-                str(error),
-                exc_info=True
+            logger.exception(
+                "Unexpected error: %s",
+                error_info['message'],
+                extra=error_info
             )
-        
-        if reraise:
-            raise error
-            
-        return error_info
-        
-    @staticmethod
-    def wrap_errors(
-        target_error: Type[BunkrrError],
-        context: str,
-        reraise: bool = True
-    ) -> Callable[[F], F]:
-        """Decorator to wrap function errors in a specific error type.
-        
-        Args:
-            target_error: The BunkrrError subclass to wrap errors in.
-            context: String describing the error context.
-            reraise: Whether to reraise wrapped errors.
-            
-        Returns:
-            A decorator function that wraps the target function.
-            
-        Example:
-            >>> @ErrorHandler.wrap_errors(ValidationError, "url_check")
-            ... def check_url(url: str) -> bool:
-            ...     if not url.startswith('http'):
-            ...         raise ValueError("Invalid URL")
-            ...     return True
-        """
-        def decorator(func: F) -> F:
-            @functools.wraps(func)
-            def wrapper(*args: Any, **kwargs: Any) -> Any:
-                try:
-                    return func(*args, **kwargs)
-                except target_error:
-                    raise
-                except Exception as e:
-                    error = target_error(str(e), details=str(e.__class__.__name__))
-                    ErrorHandler.handle_error(error, context, reraise)
-                    return None  # Only reached if reraise is False
-            return cast(F, wrapper)
-        return decorator
-        
-    @staticmethod
-    def async_wrap_errors(
-        target_error: Type[BunkrrError],
-        context: str,
-        reraise: bool = True
-    ) -> Callable[[F], F]:
-        """Decorator to wrap async function errors in a specific error type."""
-        def decorator(func: F) -> F:
-            @functools.wraps(func)
-            async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                try:
-                    return await func(*args, **kwargs)
-                except target_error:
-                    raise
-                except Exception as e:
-                    error = target_error(str(e), details=str(e.__class__.__name__))
-                    ErrorHandler.handle_error(error, context, reraise)
-                    return None  # Only reached if reraise is False
-            return cast(F, wrapper)
-        return decorator
-        
-    @staticmethod
-    def _create_error_info(
-        error: Union[BunkrrError, Exception],
-        context: str
-    ) -> Dict[str, Any]:
-        """Create a dictionary with error information."""
-        if isinstance(error, BunkrrError):
-            error_info = error.to_dict()
-            error_info['error_code'] = ERROR_CODES.get(
-                error.__class__,
-                'UNKNOWN_ERROR'
-            )
-        else:
-            error_info = {
-                'type': error.__class__.__name__,
-                'message': str(error),
-                'details': None,
-                'error_code': 'UNKNOWN_ERROR'
-            }
-            
-        error_info.update({
-            'context': context,
-            'traceback': traceback.format_exc()
-        })
-        
-        return error_info
-        
-def handle_errors(
-    func: Optional[F] = None,
-    *,
-    target_error: Type[BunkrrError] = BunkrrError,
-    context: Optional[str] = None,
-    reraise: bool = True
-) -> Union[Callable[[F], F], F]:
-    """Decorator for handling errors in functions."""
-    if func is None:
-        return lambda f: handle_errors(
-            f,
-            target_error=target_error,
-            context=context,
-            reraise=reraise
-        )
-        
-    actual_context = context or func.__name__
     
-    @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except target_error:
-            raise
-        except Exception as e:
-            error = target_error(str(e), details=str(e.__class__.__name__))
-            ErrorHandler.handle_error(error, actual_context, reraise)
-            return None  # Only reached if reraise is False
+    @classmethod
+    def wrap(cls, func: Optional[F] = None, *, context: Optional[Dict[str, Any]] = None) -> Union[F, Callable[[F], F]]:
+        """Decorator for error handling that works with both sync and async functions."""
+        def decorator(f: F) -> F:
+            is_async = inspect.iscoroutinefunction(f)
             
-    return cast(F, wrapper)
-    
-def handle_async_errors(
-    func: Optional[F] = None,
-    *,
-    target_error: Type[BunkrrError] = BunkrrError,
-    context: Optional[str] = None,
-    reraise: bool = True
-) -> Union[Callable[[F], F], F]:
-    """Decorator for handling errors in async functions."""
-    if func is None:
-        return lambda f: handle_async_errors(
-            f,
-            target_error=target_error,
-            context=context,
-            reraise=reraise
-        )
+            if is_async:
+                @wraps(f)
+                async def async_wrapper(*args, **kwargs):
+                    try:
+                        return await f(*args, **kwargs)
+                    except Exception as e:
+                        cls.handle(e, {
+                            'function': f.__name__,
+                            'args': args,
+                            'kwargs': kwargs,
+                            **(context or {})
+                        })
+                        raise
+                return async_wrapper
+            else:
+                @wraps(f)
+                def sync_wrapper(*args, **kwargs):
+                    try:
+                        return f(*args, **kwargs)
+                    except Exception as e:
+                        cls.handle(e, {
+                            'function': f.__name__,
+                            'args': args,
+                            'kwargs': kwargs,
+                            **(context or {})
+                        })
+                        raise
+                return sync_wrapper
         
-    actual_context = context or func.__name__
+        return decorator if func is None else decorator(func)
     
-    @functools.wraps(func)
-    async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return await func(*args, **kwargs)
-        except target_error:
-            raise
-        except Exception as e:
-            error = target_error(str(e), details=str(e.__class__.__name__))
-            ErrorHandler.handle_error(error, actual_context, reraise)
-            return None  # Only reached if reraise is False
-            
-    return cast(F, wrapper) 
+    # Aliases for backward compatibility
+    wrap_sync = wrap
+    wrap_async = wrap 

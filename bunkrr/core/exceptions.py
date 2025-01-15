@@ -1,149 +1,210 @@
-"""Exception handling for the bunkrr package."""
+"""Exception classes for the bunkrr package."""
 from typing import Optional, Dict, Any
 
 class BunkrrError(Exception):
-    """Base exception class for all bunkrr errors."""
+    """Base exception class for bunkrr package."""
     
-    def __init__(self, message: str, details: Optional[str] = None):
-        """Initialize the error with a message and optional details."""
+    def __init__(
+        self,
+        message: str,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize base error."""
         super().__init__(message)
         self.message = message
         self.details = details
-        
-    def __str__(self) -> str:
-        """Return a string representation of the error."""
-        if self.details:
-            return f"{self.message} - {self.details}"
-        return self.message
-        
+        self.extra = kwargs
+    
     def to_dict(self) -> Dict[str, Any]:
-        """Convert error to dictionary format."""
+        """Convert error to dictionary."""
         return {
             'type': self.__class__.__name__,
             'message': self.message,
-            'details': self.details
+            'details': self.details,
+            **self.extra
         }
 
-class ConfigError(BunkrrError):
-    """Error raised for configuration issues."""
-    pass
-
-class ValidationError(BunkrrError):
-    """Error raised for validation failures."""
-    pass
+class HTTPError(BunkrrError):
+    """HTTP request error."""
+    
+    def __init__(
+        self,
+        message: str,
+        method: str,
+        url: str,
+        status_code: Optional[int] = None,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize HTTP error."""
+        super().__init__(
+            message,
+            details=details,
+            method=method,
+            url=url,
+            status_code=status_code,
+            **kwargs
+        )
+        self.method = method
+        self.url = url
+        self.status_code = status_code
 
 class DownloadError(BunkrrError):
-    """Error raised for download failures."""
+    """Media download error."""
     
     def __init__(
         self,
         message: str,
-        url: Optional[str] = None,
+        url: str,
         status_code: Optional[int] = None,
-        details: Optional[str] = None
+        details: Optional[str] = None,
+        **kwargs: Any
     ):
-        """Initialize with download-specific information."""
-        super().__init__(message, details)
+        """Initialize download error."""
+        super().__init__(
+            message,
+            details=details,
+            url=url,
+            status_code=status_code,
+            **kwargs
+        )
         self.url = url
         self.status_code = status_code
-        
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert error to dictionary format with download info."""
-        error_dict = super().to_dict()
-        error_dict.update({
-            'url': self.url,
-            'status_code': self.status_code
-        })
-        return error_dict
 
-class RateLimitError(BunkrrError):
-    """Error raised for rate limiting issues."""
-    pass
-
-class FileSystemError(BunkrrError):
-    """Error raised for filesystem operations."""
+class ValidationError(BunkrrError):
+    """Data validation error."""
     
     def __init__(
         self,
         message: str,
-        path: Optional[str] = None,
-        operation: Optional[str] = None,
-        details: Optional[str] = None
+        field: str,
+        value: Any,
+        details: Optional[str] = None,
+        **kwargs: Any
     ):
-        """Initialize with filesystem-specific information."""
-        super().__init__(message, details)
-        self.path = path
-        self.operation = operation
-        
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert error to dictionary format with filesystem info."""
-        error_dict = super().to_dict()
-        error_dict.update({
-            'path': self.path,
-            'operation': self.operation
-        })
-        return error_dict
+        """Initialize validation error."""
+        super().__init__(
+            message,
+            details=details,
+            field=field,
+            value=value,
+            **kwargs
+        )
+        self.field = field
+        self.value = value
+
+class ConfigError(BunkrrError):
+    """Configuration error."""
+    
+    def __init__(
+        self,
+        message: str,
+        key: str,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize config error."""
+        super().__init__(
+            message,
+            details=details,
+            key=key,
+            **kwargs
+        )
+        self.key = key
 
 class ScrapyError(BunkrrError):
-    """Error raised for Scrapy-related issues."""
+    """Scrapy spider error."""
     
     def __init__(
         self,
         message: str,
-        spider_name: Optional[str] = None,
-        url: Optional[str] = None,
-        details: Optional[str] = None
-    ):
-        """Initialize with Scrapy-specific information."""
-        super().__init__(message, details)
-        self.spider_name = spider_name
-        self.url = url
-        
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert error to dictionary format with Scrapy info."""
-        error_dict = super().to_dict()
-        error_dict.update({
-            'spider_name': self.spider_name,
-            'url': self.url
-        })
-        return error_dict
-
-class HTTPError(BunkrrError):
-    """Error raised for HTTP-related issues."""
-    
-    def __init__(
-        self,
-        message: str,
-        url: Optional[str] = None,
-        method: Optional[str] = None,
+        spider: str,
+        url: str,
         status_code: Optional[int] = None,
-        details: Optional[str] = None
+        details: Optional[str] = None,
+        **kwargs: Any
     ):
-        """Initialize with HTTP-specific information."""
-        super().__init__(message, details)
+        """Initialize scrapy error."""
+        super().__init__(
+            message,
+            details=details,
+            spider=spider,
+            url=url,
+            status_code=status_code,
+            **kwargs
+        )
+        self.spider = spider
         self.url = url
-        self.method = method
         self.status_code = status_code
-        
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert error to dictionary format with HTTP info."""
-        error_dict = super().to_dict()
-        error_dict.update({
-            'url': self.url,
-            'method': self.method,
-            'status_code': self.status_code
-        })
-        return error_dict
 
-class ConfigVersionError(ConfigError):
-    """Raised when there is a configuration version mismatch or migration error."""
-    pass
+class ParsingError(BunkrrError):
+    """Data parsing error."""
+    
+    def __init__(
+        self,
+        message: str,
+        data_type: str,
+        source: str,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize parsing error."""
+        super().__init__(
+            message,
+            details=details,
+            data_type=data_type,
+            source=source,
+            **kwargs
+        )
+        self.data_type = data_type
+        self.source = source
 
-class ShutdownError(BunkrrError):
-    """Raised when there is an error during application shutdown."""
-    pass
+class RateLimitError(BunkrrError):
+    """Rate limit exceeded error."""
+    
+    def __init__(
+        self,
+        message: str,
+        url: str,
+        retry_after: Optional[float] = None,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize rate limit error."""
+        super().__init__(
+            message,
+            details=details,
+            url=url,
+            retry_after=retry_after,
+            **kwargs
+        )
+        self.url = url
+        self.retry_after = retry_after
 
-# Error codes for specific error types
+class FileSystemError(BunkrrError):
+    """File system operation error."""
+    
+    def __init__(
+        self,
+        message: str,
+        path: str,
+        operation: str,
+        details: Optional[str] = None,
+        **kwargs: Any
+    ):
+        """Initialize filesystem error."""
+        super().__init__(
+            message,
+            details=details,
+            path=path,
+            operation=operation,
+            **kwargs
+        )
+        self.path = path
+        self.operation = operation
+
+# Error codes mapping
 ERROR_CODES = {
     ConfigError: 'CONFIG_ERROR',
     ValidationError: 'VALIDATION_ERROR',
@@ -151,5 +212,6 @@ ERROR_CODES = {
     RateLimitError: 'RATE_LIMIT_ERROR',
     FileSystemError: 'FILESYSTEM_ERROR',
     ScrapyError: 'SCRAPY_ERROR',
-    HTTPError: 'HTTP_ERROR'
+    HTTPError: 'HTTP_ERROR',
+    ParsingError: 'PARSING_ERROR'
 } 

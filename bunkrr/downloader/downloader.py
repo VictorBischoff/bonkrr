@@ -15,8 +15,11 @@ from ..core.logger import setup_logger, log_exception
 from ..core.exceptions import DownloadError
 from ..ui.progress import ProgressTracker
 from .rate_limiter import RateLimiter
-from ..utils.filesystem import ensure_directory, get_unique_path, sanitize_filename
-from ..utils.http import normalize_url
+from ..utils.storage import (
+    ensure_directory, get_file_size,
+    get_unique_path, sanitize_filename
+)
+from ..utils.network import HTTPClient, HTTPConfig, normalize_url
 
 logger = setup_logger('bunkrr.downloader')
 
