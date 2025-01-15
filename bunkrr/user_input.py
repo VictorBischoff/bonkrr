@@ -1,10 +1,13 @@
 """User input handling and validation with improved organization and error handling."""
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
-from urllib.parse import urlparse
+from typing import List, Optional, ClassVar, Pattern
+from urllib.parse import urlparse, unquote
 import re
+from re import compile as re_compile
 
+from yarl import URL
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
 
@@ -24,79 +27,124 @@ class URLValidationResult:
 class URLValidator:
     """Handle URL validation with clear rules and better organization."""
     
+    # Pre-compile regex patterns for better performance
+    _PROTOCOL_PATTERN: ClassVar[Pattern] = re_compile(r'^(?:https?://)?')
+    _SUBDOMAIN_PATTERN: ClassVar[Pattern] = re_compile(
+        r'^(?:(?:www|cdn|media-files|media-files2|i-burger|i-taquito|c\.bunkr-cache|taquito|kebab)\.)?$'
+    )
+    _PATH_PATTERN: ClassVar[Pattern] = re_compile(
+        r'^/(?:a|album|albums|f|d|v|i)/[a-zA-Z0-9_-]{3,30}(?:/[a-zA-Z0-9_-]*)?/?$'
+    )
+    _ID_PATTERN: ClassVar[Pattern] = re_compile(r'^[a-zA-Z0-9_-]{3,30}$')
+    _TITLE_PATTERN: ClassVar[Pattern] = re_compile(r'(?:/[a-zA-Z0-9_-]*)?/?$')
+    
     def __init__(self, config: Optional[DownloadConfig] = None):
         self.config = config or DownloadConfig()
-        # Create regex pattern with domains from config
-        domains = '|'.join(d.lstrip('.') for d in self.config.valid_domains)
-        self.URL_PATTERN = re.compile(
-            r'^(?P<protocol>https?://)?'  # Optional protocol
-            r'(?:(?P<subdomain>www|cdn|media-files|media-files2|i-burger|i-taquito|c\.bunkr-cache|taquito|kebab)\.)?'  # Optional subdomains
-            fr'bunkr\.(?P<domain>{domains})'  # Domain from config
-            r'/(?P<type>a|album|albums|f|d|v|i)/'  # Album or file prefix
-            r'(?P<id>[a-zA-Z0-9-_]+)'  # Album/file ID
-            r'(?:/(?P<title>[^/]+))?'  # Optional title
-            r'/?$'  # Optional trailing slash
-        )
-        logger.debug("Initialized URL validator with pattern: %s", self.URL_PATTERN.pattern)
-
+        self.allowed_domains = {d.lstrip('.') for d in self.config.valid_domains}
+        domains = '|'.join(re.escape(d) for d in self.allowed_domains)
+        self._DOMAIN_PATTERN = re_compile(fr'(?:^|\.)bunkr\.(?:{domains})$')
+        logger.debug("Initialized URL validator with allowed domains: %s", self.allowed_domains)
+    
+    @lru_cache(maxsize=1024)
     def validate(self, url: str) -> URLValidationResult:
         """Validate and normalize a URL with detailed error reporting."""
+        # Check for empty URL
+        if not url.strip():
+            return URLValidationResult(is_valid=False, error_message="Invalid URL format")
+
+        # Handle non-URL strings
+        if ' ' in url or not any(c in url for c in ['/', '.']):
+            return URLValidationResult(is_valid=False, error_message="Invalid URL format")
+
         try:
-            # Add protocol if missing
+            # Handle protocol-less URLs
             if not url.startswith(('http://', 'https://')):
                 url = f'https://{url}'
 
-            # Basic URL parsing
-            parsed = urlparse(url)
-            if not parsed.netloc:
-                return URLValidationResult(
-                    is_valid=False,
-                    error_message="Invalid URL format"
-                )
+            # Use yarl's URL parsing
+            try:
+                parsed_url = URL(url)
+                if not parsed_url.host:
+                    return URLValidationResult(is_valid=False, error_message="Invalid URL format")
+            except Exception:
+                return URLValidationResult(is_valid=False, error_message="Invalid URL format")
 
-            # Check domain
-            domain_parts = parsed.netloc.split('.')
-            if len(domain_parts) < 2 or 'bunkr' not in domain_parts:
-                return URLValidationResult(
-                    is_valid=False,
-                    error_message="Not a valid Bunkr domain"
-                )
+            # Validate domain
+            if not self._validate_domain(parsed_url):
+                return URLValidationResult(is_valid=False, error_message="Not a valid Bunkr domain")
 
-            # Check against pattern
-            match = self.URL_PATTERN.match(url)
-            if not match:
-                return URLValidationResult(
-                    is_valid=False,
-                    error_message="URL doesn't match expected Bunkr format"
-                )
+            # Validate subdomain
+            if not self._validate_subdomain(parsed_url):
+                return URLValidationResult(is_valid=False, error_message="Invalid subdomain")
 
-            # Keep original URL format (don't convert /a/ to /album/)
-            normalized = self._normalize_url(match)
+            # Extract and validate ID first
+            try:
+                path_segments = [seg for seg in parsed_url.path.split('/') if seg]
+                type_idx = path_segments.index(next(t for t in path_segments if t in {'a', 'album', 'albums', 'f', 'd', 'v', 'i'}))
+                if len(path_segments) <= type_idx + 1:
+                    return URLValidationResult(is_valid=False, error_message="URL doesn't match expected Bunkr format")
+                raw_id = path_segments[type_idx + 1]
+                decoded_id = unquote(raw_id)
+                if not self._ID_PATTERN.match(decoded_id):
+                    return URLValidationResult(is_valid=False, error_message="Invalid ID format")
+            except (StopIteration, IndexError):
+                return URLValidationResult(is_valid=False, error_message="URL doesn't match expected Bunkr format")
+
+            # Validate full path format
+            if not self._validate_path(parsed_url):
+                return URLValidationResult(is_valid=False, error_message="URL doesn't match expected Bunkr format")
+
+            # Create normalized URL
+            normalized = self._normalize_url(parsed_url)
             logger.debug("Normalized URL: %s -> %s", url, normalized)
             
-            return URLValidationResult(
-                is_valid=True,
-                normalized_url=normalized
-            )
+            return URLValidationResult(is_valid=True, normalized_url=normalized)
 
         except Exception as e:
-            logger.error(f"URL validation error: {str(e)}")
+            logger.error("URL validation error: %s", str(e))
             return URLValidationResult(
                 is_valid=False,
-                error_message=f"Validation error: {str(e)}"
+                error_message="Invalid URL format"
             )
 
-    @staticmethod
-    def _normalize_url(match: re.Match) -> str:
-        """Create a normalized URL from regex match."""
-        parts = {
-            'protocol': match.group('protocol') or 'https://',
-            'subdomain': match.group('subdomain') + '.' if match.group('subdomain') else '',
-            'domain': f"bunkr.{match.group('domain')}",
-            'type': match.group('type'),  # Keep original type (a, album, f, etc.)
-            'id': match.group('id')
-        }
-        return f"{parts['protocol']}{parts['subdomain']}{parts['domain']}/{parts['type']}/{parts['id']}"
+    def _validate_domain(self, url: URL) -> bool:
+        """Validate the domain using optimized pattern matching."""
+        hostname = url.host
+        if not hostname or 'bunkr' not in hostname:
+            return False
+        return bool(self._DOMAIN_PATTERN.search(hostname))
+
+    def _validate_subdomain(self, url: URL) -> bool:
+        """Validate the subdomain using pattern matching."""
+        hostname = url.host
+        subdomain = hostname.split('bunkr.')[0] if 'bunkr.' in hostname else ''
+        return bool(self._SUBDOMAIN_PATTERN.match(subdomain))
+
+    def _validate_path(self, url: URL) -> bool:
+        """Validate the URL path using pattern matching."""
+        return bool(self._PATH_PATTERN.match(url.path))
+
+    def _validate_id(self, url: URL) -> bool:
+        """Extract and validate the resource ID."""
+        path_segments = [seg for seg in url.path.split('/') if seg]
+        try:
+            type_idx = path_segments.index(next(t for t in path_segments if t in {'a', 'album', 'albums', 'f', 'd', 'v', 'i'}))
+            raw_id = path_segments[type_idx + 1]
+        except (StopIteration, IndexError):
+            return False
+
+        decoded_id = unquote(raw_id)
+        return bool(self._ID_PATTERN.match(decoded_id))
+
+    def _normalize_url(self, url: URL) -> str:
+        """Create a normalized URL from the parsed URL."""
+        path_segments = [seg for seg in url.path.split('/') if seg]
+        type_idx = path_segments.index(next(t for t in path_segments if t in {'a', 'album', 'albums', 'f', 'd', 'v', 'i'}))
+        resource_type = path_segments[type_idx]
+        resource_id = path_segments[type_idx + 1]
+        
+        # Keep original URL format (don't convert /a/ to /album/)
+        return str(url.with_path(f'/{resource_type}/{resource_id}'))
 
 class InputHandler:
     """Handle user input with better organization and error handling."""

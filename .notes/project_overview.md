@@ -10,6 +10,7 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Concurrent download management
 - Automatic file organization
 - Robust error handling and logging
+- Optimized URL validation with caching
 
 ## Technical Architecture
 
@@ -38,7 +39,11 @@ Bunkrr is a high-performance media downloader application designed to efficientl
    - File validation rules
 
 5. **Input Handler (`user_input.py`)**
-   - URL validation and processing
+   - High-performance URL validation
+   - Pre-compiled regex patterns
+   - LRU caching for validation results
+   - Robust domain and path validation
+   - Efficient URL normalization
    - User input management
    - File path handling
 
@@ -57,6 +62,8 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Buffered file writes (1MB buffer)
 - Optimized HTML parsing with lxml and strainers
 - BeautifulSoup result caching
+- URL validation caching (1024 entries)
+- Pre-compiled regex patterns
 - Granular timeout management:
   - Connect: 30s
   - Read: 300s
@@ -70,6 +77,7 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Network error recovery
 - File system error management
 - Detailed error logging
+- Robust URL validation with clear error messages
 
 ### File Management
 - Unique folder name generation
@@ -92,12 +100,15 @@ Bunkrr is a high-performance media downloader application designed to efficientl
 - Proper exception handling
 - Performance optimization
 - Security considerations
+- Pre-compiled regex patterns
+- Efficient data structures (sets, LRU caches)
 
 ### Testing
 - Unit tests for core functionality
 - Integration tests for download flows
 - Error scenario testing
 - Performance benchmarking
+- URL validation test suite
 
 ## Future Improvements
 1. Enhanced error recovery mechanisms
